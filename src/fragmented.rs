@@ -136,6 +136,18 @@ impl FragmentedMuxer {
         }
     }
 
+    /// Set the base media decode time for the next flushed segment.
+    ///
+    /// This is useful for on-demand packaging (e.g. HLS VOD) where each segment
+    /// is produced by a fresh muxer but must carry the correct `tfdt` value
+    /// for its position in the presentation timeline.
+    ///
+    /// For live/push workflows where the muxer is kept alive across flushes,
+    /// this is managed automatically and does not need to be called.
+    pub fn set_base_media_decode_time(&mut self, time: u64) {
+        self.base_media_decode_time = time;
+    }
+
     /// Get the initialization segment (ftyp + moov).
     /// This should be sent once at the start of a stream.
     pub fn init_segment(&mut self) -> Vec<u8> {
