@@ -33,7 +33,7 @@
 //! # }
 //! ```
 
-// No imports needed currently - pure Vec-based API
+use crate::codec::h265::HevcConfig;
 
 /// Errors that can occur during fragmented MP4 muxing.
 #[derive(Debug, Clone, PartialEq)]
@@ -613,19 +613,44 @@ fn build_empty_stco() -> Vec<u8> {
 fn build_hvcc_fmp4(config: &FragmentConfig) -> Vec<u8> {
     let num_arrays: u8 = if config.vps.is_some() { 3 } else { 2 };
 
+    // Extract profile/tier/level from SPS (matches build_hvcc_box in mp4.rs)
+    let hevc_config = HevcConfig::new(
+        config.vps.clone().unwrap_or_default(),
+        config.sps.clone(),
+        config.pps.clone(),
+    );
+    let general_profile_space = hevc_config.general_profile_space();
+    let general_tier_flag = hevc_config.general_tier_flag();
+    let general_profile_idc = hevc_config.general_profile_idc();
+    let general_level_idc = hevc_config.general_level_idc();
+
+    let byte1 = (general_profile_space << 6)
+        | (if general_tier_flag { 0x20 } else { 0 })
+        | (general_profile_idc & 0x1f);
+
     let mut payload = vec![
-        1, // configuration_version
-        0, // general_profile_space (2 bits), general_tier_flag (1 bit), general_profile_idc (5 bits) - using defaults
-        0, 0, 0, 0, // general_profile_compatibility_flags
-        0, 0, 0, 0, 0, 0, // general_constraint_indicator_flags
-        0, // general_level_idc - using default
-        0, 0, // min_spatial_segmentation_idc
-        0, // parallelismType
-        0, // chromaFormat
-        0, // bitDepthLumaMinus8
-        0, // bitDepthChromaMinus8
-        0, 0,          // avgFrameRate
-        0x07, // constantFrameRate=0, numTemporalLayers=0, temporalIdNested=1, lengthSizeMinusOne=3 (4-byte lengths)
+        1,     // configuration_version
+        byte1, // general_profile_space (2) | general_tier_flag (1) | general_profile_idc (5)
+        0x60,
+        0x00,
+        0x00,
+        0x00, // general_profile_compatibility_flags
+        0x90,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,              // general_constraint_indicator_flags
+        general_level_idc, // general_level_idc
+        0xf0,
+        0x00, // min_spatial_segmentation_idc with reserved bits
+        0xfc, // parallelismType with reserved bits
+        0xfd, // chromaFormat with reserved bits (4:2:0)
+        0xf8, // bitDepthLumaMinus8 with reserved bits (8-bit)
+        0xf8, // bitDepthChromaMinus8 with reserved bits (8-bit)
+        0,
+        0,          // avgFrameRate
+        0x03, // constantFrameRate=0, numTemporalLayers=0, temporalIdNested=0, lengthSizeMinusOne=3
         num_arrays, // numOfArrays
     ];
 
