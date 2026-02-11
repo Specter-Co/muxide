@@ -33,6 +33,7 @@
 //! # }
 //! ```
 
+use crate::codec::av1::extract_av1_config;
 use crate::codec::h265::HevcConfig;
 
 /// Errors that can occur during fragmented MP4 muxing.
@@ -702,13 +703,40 @@ fn build_av01_fmp4(config: &FragmentConfig) -> Vec<u8> {
 }
 
 fn build_av1c_fmp4(config: &FragmentConfig) -> Vec<u8> {
+    let seq_header = config.av1_sequence_header.as_deref().unwrap_or(&[]);
+
+    let av1_config = extract_av1_config(seq_header);
+    let (seq_profile, seq_level_idx) = av1_config
+        .as_ref()
+        .map(|c| (c.seq_profile, c.seq_level_idx))
+        .unwrap_or((0, 0));
+
+    let byte1 = ((seq_profile & 0x07) << 5) | (seq_level_idx & 0x1f);
+
+    let byte2 = av1_config
+        .as_ref()
+        .map(|c| {
+            ((c.seq_tier & 0x01) << 7)
+                | (if c.high_bitdepth { 0x40 } else { 0 })
+                | (if c.twelve_bit { 0x20 } else { 0 })
+                | (if c.monochrome { 0x10 } else { 0 })
+                | (if c.chroma_subsampling_x { 0x08 } else { 0 })
+                | (if c.chroma_subsampling_y { 0x04 } else { 0 })
+                | (c.chroma_sample_position & 0x03)
+        })
+        .unwrap_or(0);
+
+    let obu_bytes = av1_config
+        .as_ref()
+        .map(|c| c.sequence_header.as_slice())
+        .unwrap_or(seq_header);
+
     let mut payload = Vec::new();
-    payload.push(1); // version
-    payload.push(0); // seq_profile, seq_level_idx_0, seq_tier_0, high_bitdepth, twelve_bit, monochrome, chroma_subsampling_x, chroma_subsampling_y, chroma_sample_position, reserved
-    payload.push(0); // initial_presentation_delay_present, reserved
-    if let Some(seq_header) = &config.av1_sequence_header {
-        payload.extend_from_slice(seq_header);
-    }
+    payload.push(0x81); // marker (1) + version (1)
+    payload.push(byte1); // seq_profile (3) | seq_level_idx_0 (5)
+    payload.push(byte2); // seq_tier_0 | high_bitdepth | twelve_bit | monochrome | chroma_sub_x | chroma_sub_y | chroma_sample_position
+    payload.push(0x00); // no initial presentation delay
+    payload.extend_from_slice(obu_bytes);
     build_box(b"av1C", &payload)
 }
 
