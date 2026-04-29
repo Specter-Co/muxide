@@ -35,6 +35,7 @@ clap = { version = "4.4", features = ["derive", "color", "suggestions"] }
 indicatif = "0.17"
 anyhow = "1.0"
 thiserror = "1.0"
+memchr = "2.6.3"
 
 [dev-dependencies]
 lazy_static = "1.4"

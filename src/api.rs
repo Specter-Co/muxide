@@ -494,10 +494,10 @@ impl<Writer> MuxerBuilder<Writer> {
         };
 
         let config = FragmentConfig {
+            codec,
             width,
             height,
-            timescale: 90000,           // Standard video timescale
-            fragment_duration_ms: 2000, // 2 second fragments
+            timescale: 90000,
             sps,
             pps,
             vps,

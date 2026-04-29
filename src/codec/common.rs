@@ -27,14 +27,20 @@
 /// ```
 pub struct AnnexBNalIter<'a> {
     data: &'a [u8],
-    cursor: usize,
+    /// Pending start code for the current NAL; primed on construction and
+    /// refreshed at the end of each `next` so a single scan locates the boundary
+    /// for the next iteration's NAL end.
+    next_start: Option<(usize, usize)>,
 }
 
 impl<'a> AnnexBNalIter<'a> {
     /// Create a new iterator over NAL units in the given Annex B data.
     #[inline]
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, cursor: 0 }
+        Self {
+            data,
+            next_start: find_start_code(data, 0),
+        }
     }
 }
 
@@ -42,16 +48,13 @@ impl<'a> Iterator for AnnexBNalIter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (start_code_pos, start_code_len) = find_start_code(self.data, self.cursor)?;
+        let (start_code_pos, start_code_len) = self.next_start.take()?;
         let nal_start = start_code_pos + start_code_len;
 
-        // Find the next start code (or end of data)
-        let nal_end = match find_start_code(self.data, nal_start) {
-            Some((next_pos, _)) => next_pos,
-            None => self.data.len(),
-        };
+        let next = find_start_code(self.data, nal_start);
+        let nal_end = next.map_or(self.data.len(), |(p, _)| p);
+        self.next_start = next;
 
-        self.cursor = nal_end;
         Some(&self.data[nal_start..nal_end])
     }
 }
@@ -70,28 +73,16 @@ impl<'a> Iterator for AnnexBNalIter<'a> {
 /// - `Some((position, length))` if a start code is found
 /// - `None` if no start code exists from `from` onwards
 pub fn find_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
-    if data.len() < 3 || from >= data.len() {
+    if from >= data.len() {
         return None;
     }
-
-    let mut i = from;
-    while i + 3 <= data.len() {
-        // Check 4-byte start code first
-        if i + 4 <= data.len()
-            && data[i] == 0
-            && data[i + 1] == 0
-            && data[i + 2] == 0
-            && data[i + 3] == 1
-        {
-            return Some((i, 4));
-        }
-        // Check 3-byte start code
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            return Some((i, 3));
-        }
-        i += 1;
+    // SIMD scan for the 3-byte tail; promote to 4-byte when preceded by 0x00.
+    let pos = memchr::memmem::find(&data[from..], &[0x00, 0x00, 0x01])? + from;
+    if pos > from && data[pos - 1] == 0x00 {
+        Some((pos - 1, 4))
+    } else {
+        Some((pos, 3))
     }
-    None
 }
 
 #[cfg(test)]

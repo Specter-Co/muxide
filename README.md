@@ -247,16 +247,16 @@ let mut muxer = MuxerBuilder::new(file)
     .with_vp9_config(vp9_config)
     .new_with_fragment()?;
 
-// Get init segment (ftyp + moov)
-let init_segment = muxer.init_segment();
+use muxide::fragmented::SampleSpec;
 
-// Write frames...
-muxer.write_video(0, 0, &frame, true)?;
+// Init segment (ftyp + moov)
+let mut init = Vec::new();
+muxer.write_init(&mut init);
 
-// Get media segments (moof + mdat)
-if let Some(segment) = muxer.flush_segment() {
-    // Send segment to client
-}
+// One fragment per GOP. Caller manages the sequence number and decode time.
+let samples = [SampleSpec { frame: &frame, pts: 0, dts: 0, is_sync: true }];
+let mut fragment = Vec::new();
+muxer.write_fragment(&mut fragment, 1, 0, &samples)?;
 ```
 
 ### B-Frames with Explicit DTS

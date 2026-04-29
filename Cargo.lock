@@ -445,6 +445,7 @@ dependencies = [
  "criterion",
  "indicatif",
  "lazy_static",
+ "memchr",
  "proptest",
  "serde",
  "serde_json",

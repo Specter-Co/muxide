@@ -1,7 +1,7 @@
 use muxide::api::{MuxerBuilder, MuxerConfig, VideoCodec};
 use muxide::codec::common::AnnexBNalIter;
-use muxide::codec::h264::{annexb_to_avcc, extract_avc_config, is_h264_keyframe};
-use muxide::fragmented::{FragmentConfig, FragmentedMuxer};
+use muxide::codec::h264::{extract_avc_config, is_h264_keyframe};
+use muxide::fragmented::{FragmentConfig, FragmentedMuxer, SampleSpec};
 use std::{
     env,
     fs::{self, File},
@@ -116,10 +116,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2) muxide fragmented MP4, concatenated init+segment so ffprobe can open it.
     let cfg = FragmentConfig {
+        codec: VideoCodec::H264,
         width: 640,
         height: 480,
         timescale: 90_000,
-        fragment_duration_ms: 1000,
         sps: avc.sps,
         pps: avc.pps,
         vps: None,
@@ -127,20 +127,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vp9_config: None,
     };
 
-    let mut fmux = FragmentedMuxer::new(cfg);
-    let init = fmux.init_segment();
+    let fmux = FragmentedMuxer::new(cfg);
+    let mut init = Vec::new();
+    fmux.write_init(&mut init);
 
     let dt = 3000u64;
-    for (i, au) in access_units.iter().enumerate() {
-        let ticks = (i as u64) * dt;
-        let is_key = is_h264_keyframe(au);
-        let avcc = annexb_to_avcc(au);
-        fmux.write_video(ticks, ticks, &avcc, is_key)?;
-    }
-
-    let seg = fmux
-        .flush_segment()
-        .ok_or_else(|| io::Error::other("fragment did not flush"))?;
+    let samples: Vec<SampleSpec> = access_units
+        .iter()
+        .enumerate()
+        .map(|(i, au)| {
+            let ticks = (i as u64) * dt;
+            SampleSpec {
+                frame: au,
+                pts: ticks,
+                dts: ticks,
+                is_sync: is_h264_keyframe(au),
+            }
+        })
+        .collect();
+    let mut seg = Vec::new();
+    fmux.write_fragment(&mut seg, 1, 0, &samples)?;
 
     let muxide_fmp4_combined_path = out_dir.join("muxide_fmp4_combined.mp4");
     {
