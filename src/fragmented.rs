@@ -100,6 +100,25 @@ pub struct SampleSpec<'a> {
     pub is_sync: bool,
 }
 
+/// Per-sample duration in trun: gap to next sample, or for the last sample
+/// mirror the previous gap. Single-sample fragments fall back to 3000 ticks.
+fn sample_duration(samples: &[SampleSpec<'_>], i: usize) -> u32 {
+    if i + 1 < samples.len() {
+        samples[i + 1].dts.saturating_sub(samples[i].dts) as u32
+    } else if i > 0 {
+        samples[i].dts.saturating_sub(samples[i - 1].dts) as u32
+    } else {
+        3000
+    }
+}
+
+/// The `base_media_decode_time` the next fragment should carry to continue
+/// the timeline that `write_fragment(samples)` wrote.
+pub fn next_base_media_decode_time(samples: &[SampleSpec<'_>]) -> Option<u64> {
+    let last_idx = samples.len().checked_sub(1)?;
+    Some(samples[last_idx].dts + sample_duration(samples, last_idx) as u64)
+}
+
 /// Fragmented MP4 muxer. Per-fragment counters are caller-managed so the muxer
 /// stays immutable across fragments and is safe to share.
 #[derive(Debug, Clone)]
@@ -293,14 +312,7 @@ fn write_moof_skeleton(
 
     // Per-sample: duration, size (left zero, patched after conversion), flags, cts.
     for (i, s) in samples.iter().enumerate() {
-        // Duration: dts delta to next, else mirror the previous gap, else 3000 (≈30fps).
-        let duration: u32 = if i + 1 < samples.len() {
-            (samples[i + 1].dts.saturating_sub(s.dts)) as u32
-        } else if i > 0 {
-            (s.dts.saturating_sub(samples[i - 1].dts)) as u32
-        } else {
-            3000
-        };
+        let duration = sample_duration(samples, i);
         moof[p..p + 4].copy_from_slice(&duration.to_be_bytes());
         // size (p+4..p+8) is patched in the mdat conversion loop.
         let flags: u32 = if s.is_sync { 0x0200_0000 } else { 0x0101_0000 };
