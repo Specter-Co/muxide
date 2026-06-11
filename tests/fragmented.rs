@@ -2,7 +2,7 @@
 
 use muxide::api::VideoCodec;
 use muxide::codec::vp9::Vp9Config;
-use muxide::fragmented::{FragmentConfig, FragmentedError, FragmentedMuxer, SampleSpec};
+use muxide::fragmented::{ColorInfo, FragmentConfig, FragmentedError, FragmentedMuxer, SampleSpec};
 
 fn h264_config() -> FragmentConfig {
     FragmentConfig {
@@ -156,4 +156,39 @@ fn vp9_init_and_fragment() {
     assert!(init.windows(4).any(|w| w == b"vp09"));
     assert!(fragment.windows(4).any(|w| w == b"moof"));
     assert!(fragment.windows(4).any(|w| w == b"mdat"));
+}
+
+#[test]
+fn init_omits_colr_when_color_unset() {
+    let data = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x01, 0x02, 0x03];
+    let (init, _) = write_init_and_fragment(h264_config(), &data);
+    assert!(!init.windows(4).any(|w| w == b"colr"));
+}
+
+#[test]
+fn init_writes_colr_nclx_for_each_codec() {
+    let full_range_bt709 = ColorInfo {
+        primaries: 1,
+        transfer: 1,
+        matrix: 1,
+        full_range: true,
+    };
+    for mut config in [h264_config(), h265_config(), av1_config()] {
+        let codec = config.codec;
+        config.color = Some(full_range_bt709);
+        let muxer = FragmentedMuxer::new(config);
+        let mut init = Vec::new();
+        muxer.write_init(&mut init);
+
+        let pos = init
+            .windows(4)
+            .position(|w| w == b"colr")
+            .unwrap_or_else(|| panic!("{codec:?}: no colr box in init segment"));
+        // Box payload: "nclx", primaries u16, transfer u16, matrix u16,
+        // full_range_flag in the top bit of the final byte.
+        let payload = &init[pos + 4..pos + 15];
+        assert_eq!(&payload[0..4], b"nclx", "{codec:?}");
+        assert_eq!(&payload[4..10], &[0, 1, 0, 1, 0, 1], "{codec:?}");
+        assert_eq!(payload[10], 0x80, "{codec:?}");
+    }
 }

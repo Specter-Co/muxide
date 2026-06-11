@@ -503,6 +503,7 @@ impl<Writer> MuxerBuilder<Writer> {
             vps,
             av1_sequence_header,
             vp9_config,
+            color: None,
         };
 
         Ok(FragmentedMuxer::new(config))

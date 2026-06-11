@@ -70,6 +70,25 @@ pub struct FragmentConfig {
     pub av1_sequence_header: Option<Vec<u8>>,
     /// VP9 configuration (extracted from first keyframe).
     pub vp9_config: Option<crate::codec::vp9::Vp9Config>,
+    /// Color description written as a `colr` (nclx) box in the sample entry.
+    /// When `None`, no `colr` box is emitted and players fall back to their
+    /// own defaults (typically limited-range BT.709).
+    pub color: Option<ColorInfo>,
+}
+
+/// Color description for the `colr` (nclx) box, using ISO 23001-8 (CICP)
+/// code points, the same numbering as H.264/H.265 VUI and the AV1
+/// sequence header (e.g. BT.709 = 1 for all three fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorInfo {
+    /// `colour_primaries` code point.
+    pub primaries: u16,
+    /// `transfer_characteristics` code point.
+    pub transfer: u16,
+    /// `matrix_coefficients` code point.
+    pub matrix: u16,
+    /// `full_range_flag`: true for full/PC range, false for limited/TV range.
+    pub full_range: bool,
 }
 
 impl Default for FragmentConfig {
@@ -86,6 +105,7 @@ impl Default for FragmentConfig {
             vps: None,
             av1_sequence_header: None,
             vp9_config: None,
+            color: None,
         }
     }
 }
@@ -548,6 +568,22 @@ fn write_avc1(out: &mut Vec<u8>, config: &FragmentConfig) {
     write_box(out, b"avc1", |o| {
         write_visual_sample_entry_header(o, config.width, config.height);
         write_avcc(o, config);
+        write_colr(o, config);
+    });
+}
+
+/// Append a `colr` (nclx) box when the config carries color info. Placed
+/// after the codec configuration box, matching ffmpeg/MP4Box ordering.
+fn write_colr(out: &mut Vec<u8>, config: &FragmentConfig) {
+    let Some(color) = &config.color else {
+        return;
+    };
+    write_box(out, b"colr", |o| {
+        o.extend_from_slice(b"nclx");
+        o.extend_from_slice(&color.primaries.to_be_bytes());
+        o.extend_from_slice(&color.transfer.to_be_bytes());
+        o.extend_from_slice(&color.matrix.to_be_bytes());
+        o.push(if color.full_range { 0x80 } else { 0x00 });
     });
 }
 
@@ -571,6 +607,7 @@ fn write_hvc1(out: &mut Vec<u8>, config: &FragmentConfig) {
     write_box(out, b"hvc1", |o| {
         write_visual_sample_entry_header(o, config.width, config.height);
         write_hvcc(o, config);
+        write_colr(o, config);
     });
 }
 
@@ -625,6 +662,7 @@ fn write_av01(out: &mut Vec<u8>, config: &FragmentConfig) {
     write_box(out, b"av01", |o| {
         write_visual_sample_entry_header(o, config.width, config.height);
         write_av1c(o, config);
+        write_colr(o, config);
     });
 }
 
