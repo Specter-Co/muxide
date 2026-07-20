@@ -201,8 +201,14 @@ pub fn default_avc_config() -> AvcConfig {
 /// //          ^--- 4-byte length (3)     ^--- NAL data
 /// ```
 pub fn annexb_to_avcc(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(data.len() + 4);
+    annexb_to_avcc_into(data, &mut out);
+    out
+}
 
+/// Append the AVCC-converted bytes onto `out`.
+pub fn annexb_to_avcc_into(data: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
     for nal in AnnexBNalIter::new(data) {
         if nal.is_empty() {
             continue;
@@ -213,13 +219,11 @@ pub fn annexb_to_avcc(data: &[u8]) -> Vec<u8> {
     }
 
     // Fallback: if no start codes found, treat entire input as single NAL
-    if out.is_empty() && !data.is_empty() {
+    if out.len() == start && !data.is_empty() {
         let len = data.len() as u32;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(data);
     }
-
-    out
 }
 
 /// Check if the given Annex B data represents a keyframe (IDR slice).

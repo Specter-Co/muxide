@@ -28,6 +28,11 @@ pub mod opus;
 pub mod vp9;
 
 pub use common::{find_start_code, AnnexBNalIter};
-pub use h264::{annexb_to_avcc, extract_avc_config, is_h264_keyframe, AvcConfig};
-pub use h265::{extract_hevc_config, hevc_annexb_to_hvcc, is_hevc_keyframe, HevcConfig};
+pub use h264::{
+    annexb_to_avcc, annexb_to_avcc_into, extract_avc_config, is_h264_keyframe, AvcConfig,
+};
+pub use h265::{
+    extract_hevc_config, hevc_annexb_to_hvcc, hevc_annexb_to_hvcc_into, is_hevc_keyframe,
+    HevcConfig,
+};
 pub use opus::{is_valid_opus_packet, opus_packet_samples, OpusConfig, OPUS_SAMPLE_RATE};

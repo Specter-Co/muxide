@@ -1,6 +1,6 @@
 use muxide::api::{MuxerBuilder, MuxerConfig, VideoCodec};
-use muxide::codec::h264::{annexb_to_avcc, extract_avc_config};
-use muxide::fragmented::{FragmentConfig, FragmentedMuxer};
+use muxide::codec::h264::extract_avc_config;
+use muxide::fragmented::{FragmentConfig, FragmentedMuxer, SampleSpec};
 use std::{
     env,
     fs::{self, File},
@@ -74,11 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let cfg = FragmentConfig {
+        codec: VideoCodec::H264,
         width: 640,
         height: 480,
         timescale: 90_000,
-        // Make it very easy to flush a segment with just a few frames.
-        fragment_duration_ms: 1,
         sps: avc.sps,
         pps: avc.pps,
         vps: None,
@@ -86,22 +85,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vp9_config: None,
     };
 
-    let mut fmux = FragmentedMuxer::new(cfg);
-    let init = fmux.init_segment();
-
-    let f0 = annexb_to_avcc(&frame0);
-    let f1 = annexb_to_avcc(&frame1);
-    let f2 = annexb_to_avcc(&frame2);
+    let fmux = FragmentedMuxer::new(cfg);
+    let mut init = Vec::new();
+    fmux.write_init(&mut init);
 
     // 30fps in a 90kHz timescale.
     let dt = 3000u64;
-    fmux.write_video(0, 0, &f0, true)?;
-    fmux.write_video(dt, dt, &f1, false)?;
-    fmux.write_video(2 * dt, 2 * dt, &f2, false)?;
-
-    let seg = fmux
-        .flush_segment()
-        .ok_or_else(|| io::Error::other("fragment did not flush"))?;
+    let samples = [
+        SampleSpec {
+            frame: &frame0,
+            pts: 0,
+            dts: 0,
+            is_sync: true,
+        },
+        SampleSpec {
+            frame: &frame1,
+            pts: dt,
+            dts: dt,
+            is_sync: false,
+        },
+        SampleSpec {
+            frame: &frame2,
+            pts: 2 * dt,
+            dts: 2 * dt,
+            is_sync: false,
+        },
+    ];
+    let mut seg = Vec::new();
+    fmux.write_fragment(&mut seg, 1, 0, &samples)?;
 
     let muxide_fmp4_combined_path = out_dir.join("muxide_fmp4_combined.mp4");
     {

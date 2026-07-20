@@ -53,7 +53,7 @@ pub mod nal_type {
     pub const AUD: u8 = 35;
     /// End of sequence
     pub const EOS: u8 = 36;
-    /// End of bitstream  
+    /// End of bitstream
     pub const EOB: u8 = 37;
     /// Filler data
     pub const FD: u8 = 38;
@@ -85,27 +85,48 @@ impl HevcConfig {
 
     /// Extract general_profile_space from the SPS (bits 0-1 of byte 3).
     pub fn general_profile_space(&self) -> u8 {
-        self.sps.get(3).map(|b| (b >> 6) & 0x03).unwrap_or(0)
+        sps_general_profile_space(&self.sps)
     }
 
     /// Extract general_tier_flag from the SPS (bit 2 of byte 3).
     pub fn general_tier_flag(&self) -> bool {
-        self.sps
-            .get(3)
-            .map(|b| (b >> 5) & 0x01 != 0)
-            .unwrap_or(false)
+        sps_general_tier_flag(&self.sps)
     }
 
     /// Extract general_profile_idc from the SPS (bits 3-7 of byte 3).
     pub fn general_profile_idc(&self) -> u8 {
-        self.sps.get(3).map(|b| b & 0x1f).unwrap_or(1)
+        sps_general_profile_idc(&self.sps)
     }
 
     /// Extract general_level_idc from the SPS (byte 14).
     /// Level 5.1 = 153, Level 4.0 = 120, Level 3.1 = 93
     pub fn general_level_idc(&self) -> u8 {
-        self.sps.get(14).copied().unwrap_or(93)
+        sps_general_level_idc(&self.sps)
     }
+}
+
+/// Extract general_profile_space from the SPS (bits 0-1 of byte 3).
+#[inline]
+pub fn sps_general_profile_space(sps: &[u8]) -> u8 {
+    sps.get(3).map(|b| (b >> 6) & 0x03).unwrap_or(0)
+}
+
+/// Extract general_tier_flag from the SPS (bit 2 of byte 3).
+#[inline]
+pub fn sps_general_tier_flag(sps: &[u8]) -> bool {
+    sps.get(3).map(|b| (b >> 5) & 0x01 != 0).unwrap_or(false)
+}
+
+/// Extract general_profile_idc from the SPS (bits 3-7 of byte 3).
+#[inline]
+pub fn sps_general_profile_idc(sps: &[u8]) -> u8 {
+    sps.get(3).map(|b| b & 0x1f).unwrap_or(1)
+}
+
+/// Extract general_level_idc from the SPS (byte 14).
+#[inline]
+pub fn sps_general_level_idc(sps: &[u8]) -> u8 {
+    sps.get(14).copied().unwrap_or(93)
 }
 
 /// Extract the NAL unit type from an H.265 NAL header.
@@ -226,8 +247,14 @@ pub fn extract_hevc_config(data: &[u8]) -> Option<HevcConfig> {
 ///
 /// Same conversion as H.264: replaces start codes with 4-byte NAL lengths.
 pub fn hevc_annexb_to_hvcc(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(data.len() + 4);
+    hevc_annexb_to_hvcc_into(data, &mut out);
+    out
+}
 
+/// Append the HVCC-converted bytes onto `out`.
+pub fn hevc_annexb_to_hvcc_into(data: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
     for nal in AnnexBNalIter::new(data) {
         if nal.is_empty() {
             continue;
@@ -238,13 +265,11 @@ pub fn hevc_annexb_to_hvcc(data: &[u8]) -> Vec<u8> {
     }
 
     // Fallback: if no start codes found, treat entire input as single NAL
-    if out.is_empty() && !data.is_empty() {
+    if out.len() == start && !data.is_empty() {
         let len = data.len() as u32;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(data);
     }
-
-    out
 }
 
 /// Check if the given Annex B data represents an HEVC keyframe (IRAP).

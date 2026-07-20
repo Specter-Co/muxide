@@ -494,15 +494,16 @@ impl<Writer> MuxerBuilder<Writer> {
         };
 
         let config = FragmentConfig {
+            codec,
             width,
             height,
-            timescale: 90000,           // Standard video timescale
-            fragment_duration_ms: 2000, // 2 second fragments
+            timescale: 90000,
             sps,
             pps,
             vps,
             av1_sequence_header,
             vp9_config,
+            color: None,
         };
 
         Ok(FragmentedMuxer::new(config))

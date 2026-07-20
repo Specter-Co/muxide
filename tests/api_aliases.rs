@@ -16,10 +16,11 @@ fn test_new_with_fragment_creates_fragmented_muxer() {
         .new_with_fragment();
 
     assert!(result.is_ok());
-    let mut muxer: FragmentedMuxer = result.unwrap();
+    let muxer: FragmentedMuxer = result.unwrap();
 
     // Verify init segment is available
-    let init_segment = muxer.init_segment();
+    let mut init_segment = Vec::new();
+    muxer.write_init(&mut init_segment);
     assert!(!init_segment.is_empty());
     // Check that it contains "ftyp" box (may not be at the start due to box structure)
     assert!(init_segment.windows(4).any(|w| w == b"ftyp"));
@@ -94,10 +95,11 @@ fn test_new_with_fragment_h265_success() {
         .new_with_fragment();
 
     assert!(result.is_ok());
-    let mut muxer: FragmentedMuxer = result.unwrap();
+    let muxer: FragmentedMuxer = result.unwrap();
 
     // Verify init segment contains hvc1
-    let init = muxer.init_segment();
+    let mut init = Vec::new();
+    muxer.write_init(&mut init);
     assert!(init.windows(4).any(|w| w == b"hvc1"));
 }
 
@@ -122,10 +124,11 @@ fn test_new_with_fragment_av1_success() {
         .new_with_fragment();
 
     assert!(result.is_ok());
-    let mut muxer: FragmentedMuxer = result.unwrap();
+    let muxer: FragmentedMuxer = result.unwrap();
 
     // Verify init segment contains av01
-    let init = muxer.init_segment();
+    let mut init = Vec::new();
+    muxer.write_init(&mut init);
     assert!(init.windows(4).any(|w| w == b"av01"));
 }
 
@@ -150,10 +153,11 @@ fn test_new_with_fragment_vp9_success() {
         .new_with_fragment();
 
     assert!(result.is_ok());
-    let mut muxer: FragmentedMuxer = result.unwrap();
+    let muxer: FragmentedMuxer = result.unwrap();
 
     // Verify init segment contains vp09
-    let init = muxer.init_segment();
+    let mut init = Vec::new();
+    muxer.write_init(&mut init);
     assert!(init.windows(4).any(|w| w == b"vp09"));
 }
 

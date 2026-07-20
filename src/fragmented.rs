@@ -7,72 +7,62 @@
 //! - Low-latency live streaming
 //!
 //! # Example
+//!
 //! ```
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use muxide::api::{MuxerBuilder, VideoCodec};
+//! use muxide::api::VideoCodec;
+//! use muxide::fragmented::{FragmentConfig, FragmentedMuxer, SampleSpec};
 //!
-//! // Create a fragmented muxer using the builder API
-//! let mut muxer = MuxerBuilder::new(Vec::<u8>::new())
-//!     .video(VideoCodec::H264, 1920, 1080, 30.0)
-//!     .with_sps(vec![0x67, 0x42, 0x00, 0x1e, 0xda, 0x02, 0x80, 0x2d, 0x8b, 0x11]) // SPS
-//!     .with_pps(vec![0x68, 0xce, 0x38, 0x80]) // PPS
-//!     .new_with_fragment()?;
+//! let config = FragmentConfig {
+//!     codec: VideoCodec::H264,
+//!     width: 1920,
+//!     height: 1080,
+//!     timescale: 90_000,
+//!     sps: vec![0x67, 0x42, 0x00, 0x1e, 0xda, 0x02, 0x80, 0x2d, 0x8b, 0x11],
+//!     pps: vec![0x68, 0xce, 0x38, 0x80],
+//!     ..Default::default()
+//! };
 //!
-//! // Get init segment (write once at start)
-//! let init_segment = muxer.init_segment();
+//! let muxer = FragmentedMuxer::new(config);
 //!
-//! // Write frames...
-//! let data = vec![0u8; 100]; // Your frame data
-//! muxer.write_video(0, 0, &data, true)?;
+//! let mut out = Vec::new();
+//! muxer.write_init(&mut out);
+//! // send `out` to client; reuse the buffer when ready.
 //!
-//! // Get media segment when ready
-//! if let Some(segment) = muxer.flush_segment() {
-//!     // Send segment to client
-//! }
-//! # Ok(())
-//! # }
+//! let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb];
+//! let samples = [SampleSpec { frame: &frame, pts: 0, dts: 0, is_sync: true }];
+//! out.clear();
+//! muxer.write_fragment(&mut out, 1, 0, &samples).unwrap();
 //! ```
 
+use crate::api::VideoCodec;
 use crate::codec::av1::extract_av1_config;
-use crate::codec::h265::HevcConfig;
+use crate::codec::h264::annexb_to_avcc_into;
+use crate::codec::h265::{
+    hevc_annexb_to_hvcc_into, sps_general_level_idc, sps_general_profile_idc,
+    sps_general_profile_space, sps_general_tier_flag,
+};
 
 /// Errors that can occur during fragmented MP4 muxing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FragmentedError {
-    /// DTS values must be non-decreasing.
+    #[error("DTS values must be non-decreasing: prev={prev_dts}, curr={curr_dts}")]
     NonMonotonicDts { prev_dts: u64, curr_dts: u64 },
-}
-
-impl std::error::Error for FragmentedError {}
-
-impl std::fmt::Display for FragmentedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FragmentedError::NonMonotonicDts { prev_dts, curr_dts } => {
-                write!(
-                    f,
-                    "DTS values must be non-decreasing: prev={}, curr={}",
-                    prev_dts, curr_dts
-                )
-            }
-        }
-    }
 }
 
 /// Configuration for fragmented MP4 output.
 #[derive(Debug, Clone)]
 pub struct FragmentConfig {
+    /// Video codec; selects sample-entry box, conversion path, and required parameter sets.
+    pub codec: VideoCodec,
     /// Video width in pixels.
     pub width: u32,
     /// Video height in pixels.
     pub height: u32,
     /// Media timescale (typically 90000 for video).
     pub timescale: u32,
-    /// Target fragment duration in milliseconds.
-    pub fragment_duration_ms: u32,
-    /// SPS NAL unit (H.264 required for init segment).
+    /// SPS NAL unit (H.264 / H.265 required for init segment).
     pub sps: Vec<u8>,
-    /// PPS NAL unit (H.264 required for init segment).
+    /// PPS NAL unit (H.264 / H.265 required for init segment).
     pub pps: Vec<u8>,
     /// VPS NAL unit (H.265 required for init segment).
     pub vps: Option<Vec<u8>>,
@@ -80,6 +70,25 @@ pub struct FragmentConfig {
     pub av1_sequence_header: Option<Vec<u8>>,
     /// VP9 configuration (extracted from first keyframe).
     pub vp9_config: Option<crate::codec::vp9::Vp9Config>,
+    /// Color description written as a `colr` (nclx) box in the sample entry.
+    /// When `None`, no `colr` box is emitted and players fall back to their
+    /// own defaults (typically limited-range BT.709).
+    pub color: Option<ColorInfo>,
+}
+
+/// Color description for the `colr` (nclx) box, using ISO 23001-8 (CICP)
+/// code points, the same numbering as H.264/H.265 VUI and the AV1
+/// sequence header (e.g. BT.709 = 1 for all three fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorInfo {
+    /// `colour_primaries` code point.
+    pub primaries: u16,
+    /// `transfer_characteristics` code point.
+    pub transfer: u16,
+    /// `matrix_coefficients` code point.
+    pub matrix: u16,
+    /// `full_range_flag`: true for full/PC range, false for limited/TV range.
+    pub full_range: bool,
 }
 
 impl Default for FragmentConfig {
@@ -87,862 +96,631 @@ impl Default for FragmentConfig {
         // Note: This default provides example SPS/PPS for testing.
         // In production, you must provide actual SPS/PPS from your encoder.
         Self {
+            codec: VideoCodec::H264,
             width: 1920,
             height: 1080,
             timescale: 90000,
-            fragment_duration_ms: 2000,
             sps: vec![0x67, 0x42, 0x00, 0x1e, 0xda, 0x02, 0x80, 0x2d, 0x8b, 0x11],
             pps: vec![0x68, 0xce, 0x38, 0x80],
             vps: None,
             av1_sequence_header: None,
             vp9_config: None,
+            color: None,
         }
     }
 }
 
-/// Sample information for fragmented muxing.
-#[derive(Debug, Clone)]
-struct FragmentSample {
-    /// Presentation timestamp in timescale units.
-    pts: u64,
-    /// Decode timestamp in timescale units.
-    dts: u64,
-    /// Sample data (AVCC format).
-    data: Vec<u8>,
-    /// Whether this is a sync sample (keyframe).
-    is_sync: bool,
+/// One sample to write into a fragment. `frame` is in the codec's wire format
+/// (Annex B for H.264/H.265, OBU for AV1/VP9); the muxer converts as it writes.
+#[derive(Debug, Clone, Copy)]
+pub struct SampleSpec<'a> {
+    pub frame: &'a [u8],
+    pub pts: u64,
+    pub dts: u64,
+    pub is_sync: bool,
 }
 
-/// A fragmented MP4 muxer for streaming applications.
-#[derive(Debug)]
+/// Per-sample duration in trun: gap to next sample, or for the last sample
+/// mirror the previous gap. Single-sample fragments fall back to 3000 ticks.
+fn sample_duration(samples: &[SampleSpec<'_>], i: usize) -> u32 {
+    if i + 1 < samples.len() {
+        samples[i + 1].dts.saturating_sub(samples[i].dts) as u32
+    } else if i > 0 {
+        samples[i].dts.saturating_sub(samples[i - 1].dts) as u32
+    } else {
+        3000
+    }
+}
+
+/// The `base_media_decode_time` the next fragment should carry to continue
+/// the timeline that `write_fragment(samples)` wrote.
+pub fn next_base_media_decode_time(samples: &[SampleSpec<'_>]) -> Option<u64> {
+    let last_idx = samples.len().checked_sub(1)?;
+    Some(samples[last_idx].dts + sample_duration(samples, last_idx) as u64)
+}
+
+/// Fragmented MP4 muxer. Per-fragment counters are caller-managed so the muxer
+/// stays immutable across fragments and is safe to share.
+#[derive(Debug, Clone)]
 pub struct FragmentedMuxer {
     config: FragmentConfig,
-    samples: Vec<FragmentSample>,
-    sequence_number: u32,
-    base_media_decode_time: u64,
-    init_segment: Option<Vec<u8>>,
-    last_dts: Option<u64>,
 }
 
 impl FragmentedMuxer {
-    /// Create a new fragmented muxer with the given configuration.
     pub fn new(config: FragmentConfig) -> Self {
-        Self {
-            config,
-            samples: Vec::new(),
-            sequence_number: 1,
-            base_media_decode_time: 0,
-            init_segment: None,
-            last_dts: None,
-        }
+        Self { config }
     }
 
-    /// Set the base media decode time for the next flushed segment.
-    ///
-    /// This is useful for on-demand packaging (e.g. HLS VOD) where each segment
-    /// is produced by a fresh muxer but must carry the correct `tfdt` value
-    /// for its position in the presentation timeline.
-    ///
-    /// For live/push workflows where the muxer is kept alive across flushes,
-    /// this is managed automatically and does not need to be called.
-    pub fn set_base_media_decode_time(&mut self, time: u64) {
-        self.base_media_decode_time = time;
+    pub fn config(&self) -> &FragmentConfig {
+        &self.config
     }
 
-    /// Get the initialization segment (ftyp + moov).
-    /// This should be sent once at the start of a stream.
-    pub fn init_segment(&mut self) -> Vec<u8> {
-        if let Some(ref init) = self.init_segment {
-            return init.clone();
-        }
-
-        let mut buf = Vec::new();
-
-        // ftyp box
-        let ftyp = build_ftyp_fmp4();
-        buf.extend_from_slice(&ftyp);
-
-        // moov box (no sample tables for fMP4)
-        let moov = build_moov_fmp4(&self.config);
-        buf.extend_from_slice(&moov);
-
-        self.init_segment = Some(buf.clone());
-        buf
+    /// Append the init segment (ftyp + moov) to `out`.
+    pub fn write_init(&self, out: &mut Vec<u8>) {
+        write_ftyp(out);
+        write_moov(out, &self.config);
     }
 
-    /// Queue a video sample for the current fragment.
-    ///
-    /// - `pts`: Presentation timestamp in timescale units
-    /// - `dts`: Decode timestamp in timescale units
-    /// - `data`: Sample data in MP4 length-prefixed format (4-byte NAL length prefixes)
-    /// - `is_sync`: True if this is a sync sample (keyframe)
-    pub fn write_video(
-        &mut self,
-        pts: u64,
-        dts: u64,
-        data: &[u8],
-        is_sync: bool,
+    /// Append one media fragment (moof + mdat) to `out`. Sample bytes are
+    /// converted into the mdat in a single pass; per-sample sizes are
+    /// patched into the trun region as they're discovered.
+    pub fn write_fragment(
+        &self,
+        out: &mut Vec<u8>,
+        sequence_number: u32,
+        base_media_decode_time: u64,
+        samples: &[SampleSpec<'_>],
     ) -> Result<(), FragmentedError> {
-        // Enforce monotonic DTS
-        if let Some(last) = self.last_dts {
-            if dts < last {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        for w in samples.windows(2) {
+            if w[1].dts < w[0].dts {
                 return Err(FragmentedError::NonMonotonicDts {
-                    prev_dts: last,
-                    curr_dts: dts,
+                    prev_dts: w[0].dts,
+                    curr_dts: w[1].dts,
                 });
             }
         }
-        self.last_dts = Some(dts);
 
-        self.samples.push(FragmentSample {
-            pts,
-            dts,
-            data: data.to_vec(),
-            is_sync,
-        });
+        let n = samples.len();
+        let moof_size = moof_size_for(n);
+        let moof_start = out.len();
+        let data_offset = (moof_size + MDAT_HEADER_SIZE) as u32;
+
+        let frame_total: usize = samples.iter().map(|s| s.frame.len()).sum();
+        out.reserve(moof_size + MDAT_HEADER_SIZE + frame_total + 4 * n);
+        out.resize(moof_start + moof_size, 0);
+
+        // Write the moof up front — every field except per-sample sizes is
+        // computable from `samples`. Sizes are patched inline below.
+        write_moof_skeleton(
+            &mut out[moof_start..moof_start + moof_size],
+            sequence_number,
+            base_media_decode_time,
+            data_offset,
+            samples,
+        );
+        let trun_samples_off = moof_start + trun_samples_offset_in_moof();
+
+        let mdat_header_start = out.len();
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(b"mdat");
+
+        for (i, s) in samples.iter().enumerate() {
+            let pre = out.len();
+            convert_into(self.config.codec, s.frame, out);
+            let size = (out.len() - pre) as u32;
+            let size_off = trun_samples_off + i * TRUN_PER_SAMPLE + 4;
+            out[size_off..size_off + 4].copy_from_slice(&size.to_be_bytes());
+        }
+
+        let mdat_size = (out.len() - mdat_header_start) as u32;
+        out[mdat_header_start..mdat_header_start + 4].copy_from_slice(&mdat_size.to_be_bytes());
+
         Ok(())
     }
+}
 
-    /// Flush all queued samples as a media segment (moof + mdat).
-    /// Returns None if there are no samples to flush.
-    pub fn flush_segment(&mut self) -> Option<Vec<u8>> {
-        if self.samples.is_empty() {
-            return None;
-        }
+// ============================================================================
+// Codec conversion into output
+// ============================================================================
 
-        let samples = std::mem::take(&mut self.samples);
-        let segment = build_media_segment(
-            &samples,
-            self.sequence_number,
-            self.base_media_decode_time,
-            self.config.timescale,
-        );
-
-        // Update state for next segment
-        self.sequence_number += 1;
-        if let Some(last) = samples.last() {
-            // Estimate next base_media_decode_time
-            if samples.len() >= 2 {
-                let duration_total = last.dts.saturating_sub(samples[0].dts);
-                let avg_duration = duration_total / (samples.len() as u64 - 1);
-                self.base_media_decode_time = last.dts + avg_duration;
-            } else {
-                self.base_media_decode_time = last.dts + 3000; // Fallback: 1 frame at 30fps
-            }
-        }
-
-        Some(segment)
-    }
-
-    /// Check if we have enough samples to make a fragment.
-    pub fn ready_to_flush(&self) -> bool {
-        if self.samples.is_empty() {
-            return false;
-        }
-
-        if self.samples.len() < 2 {
-            return false;
-        }
-
-        let first_dts = self.samples[0].dts;
-        let last_dts = self.samples.last().unwrap().dts;
-        let duration_ticks = last_dts.saturating_sub(first_dts);
-        let duration_ms = duration_ticks * 1000 / self.config.timescale as u64;
-
-        duration_ms >= self.config.fragment_duration_ms as u64
-    }
-
-    /// Get current fragment duration in milliseconds.
-    pub fn current_fragment_duration_ms(&self) -> u64 {
-        if self.samples.len() < 2 {
-            return 0;
-        }
-        let first_dts = self.samples[0].dts;
-        let last_dts = self.samples.last().unwrap().dts;
-        let duration_ticks = last_dts.saturating_sub(first_dts);
-        duration_ticks * 1000 / self.config.timescale as u64
+fn convert_into(codec: VideoCodec, frame: &[u8], out: &mut Vec<u8>) {
+    match codec {
+        VideoCodec::H264 => annexb_to_avcc_into(frame, out),
+        VideoCodec::H265 => hevc_annexb_to_hvcc_into(frame, out),
+        VideoCodec::Av1 | VideoCodec::Vp9 => out.extend_from_slice(frame),
     }
 }
 
 // ============================================================================
-// Box building functions for fMP4
+// moof: closed-form sizes from sample count.
 // ============================================================================
 
-fn build_box(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let size = (8 + payload.len()) as u32;
-    let mut buf = Vec::with_capacity(size as usize);
-    buf.extend_from_slice(&size.to_be_bytes());
-    buf.extend_from_slice(typ);
-    buf.extend_from_slice(payload);
-    buf
+const MFHD_SIZE: usize = 16;
+const TFHD_SIZE: usize = 16;
+const TFDT_SIZE: usize = 20;
+const TRUN_HEADER_SIZE: usize = 20;
+const TRUN_PER_SAMPLE: usize = 16;
+const TRAF_HEADER_SIZE: usize = 8;
+const MOOF_HEADER_SIZE: usize = 8;
+const MDAT_HEADER_SIZE: usize = 8;
+
+fn moof_size_for(sample_count: usize) -> usize {
+    MOOF_HEADER_SIZE
+        + MFHD_SIZE
+        + TRAF_HEADER_SIZE
+        + TFHD_SIZE
+        + TFDT_SIZE
+        + TRUN_HEADER_SIZE
+        + TRUN_PER_SAMPLE * sample_count
 }
 
-fn build_ftyp_fmp4() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(b"iso5"); // Major brand: ISO Base Media File Format v5
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Minor version
-    payload.extend_from_slice(b"iso5"); // Compatible brands
-    payload.extend_from_slice(b"iso6");
-    payload.extend_from_slice(b"mp41");
-    build_box(b"ftyp", &payload)
+/// Byte offset of the first per-sample trun entry within a moof.
+fn trun_samples_offset_in_moof() -> usize {
+    MOOF_HEADER_SIZE + MFHD_SIZE + TRAF_HEADER_SIZE + TFHD_SIZE + TFDT_SIZE + TRUN_HEADER_SIZE
 }
 
-fn build_moov_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
+/// Write the moof in full except for per-sample sizes, which are patched
+/// into the trun region as samples are appended to mdat.
+fn write_moof_skeleton(
+    moof: &mut [u8],
+    sequence_number: u32,
+    base_media_decode_time: u64,
+    data_offset: u32,
+    samples: &[SampleSpec<'_>],
+) {
+    let total = moof.len();
+    debug_assert_eq!(total, moof_size_for(samples.len()));
 
-    // mvhd (movie header)
-    let mvhd = build_mvhd_fmp4(config.timescale);
-    payload.extend_from_slice(&mvhd);
+    moof[0..4].copy_from_slice(&(total as u32).to_be_bytes());
+    moof[4..8].copy_from_slice(b"moof");
 
-    // mvex (movie extends) - required for fragmented MP4
-    let mvex = build_mvex();
-    payload.extend_from_slice(&mvex);
+    let mut p = MOOF_HEADER_SIZE;
 
-    // trak (video track)
-    let trak = build_trak_fmp4(config);
-    payload.extend_from_slice(&trak);
+    // mfhd
+    moof[p..p + 4].copy_from_slice(&(MFHD_SIZE as u32).to_be_bytes());
+    moof[p + 4..p + 8].copy_from_slice(b"mfhd");
+    moof[p + 8..p + 12].copy_from_slice(&0u32.to_be_bytes()); // version + flags
+    moof[p + 12..p + 16].copy_from_slice(&sequence_number.to_be_bytes());
+    p += MFHD_SIZE;
 
-    build_box(b"moov", &payload)
+    // traf
+    let traf_size = TRAF_HEADER_SIZE
+        + TFHD_SIZE
+        + TFDT_SIZE
+        + TRUN_HEADER_SIZE
+        + TRUN_PER_SAMPLE * samples.len();
+    moof[p..p + 4].copy_from_slice(&(traf_size as u32).to_be_bytes());
+    moof[p + 4..p + 8].copy_from_slice(b"traf");
+    p += TRAF_HEADER_SIZE;
+
+    // tfhd
+    moof[p..p + 4].copy_from_slice(&(TFHD_SIZE as u32).to_be_bytes());
+    moof[p + 4..p + 8].copy_from_slice(b"tfhd");
+    // Flags: 0x020000 = default-base-is-moof
+    moof[p + 8..p + 12].copy_from_slice(&0x0002_0000_u32.to_be_bytes());
+    moof[p + 12..p + 16].copy_from_slice(&1u32.to_be_bytes()); // track ID
+    p += TFHD_SIZE;
+
+    // tfdt
+    moof[p..p + 4].copy_from_slice(&(TFDT_SIZE as u32).to_be_bytes());
+    moof[p + 4..p + 8].copy_from_slice(b"tfdt");
+    // Version 1 for 64-bit decode time.
+    moof[p + 8..p + 12].copy_from_slice(&0x0100_0000_u32.to_be_bytes());
+    moof[p + 12..p + 20].copy_from_slice(&base_media_decode_time.to_be_bytes());
+    p += TFDT_SIZE;
+
+    // trun
+    let trun_size = TRUN_HEADER_SIZE + TRUN_PER_SAMPLE * samples.len();
+    moof[p..p + 4].copy_from_slice(&(trun_size as u32).to_be_bytes());
+    moof[p + 4..p + 8].copy_from_slice(b"trun");
+    // Flags:
+    //  0x000001 data-offset-present
+    //  0x000100 sample-duration-present
+    //  0x000200 sample-size-present
+    //  0x000400 sample-flags-present
+    //  0x000800 sample-composition-time-offset-present
+    let trun_flags: u32 = 0x000001 | 0x000100 | 0x000200 | 0x000400 | 0x000800;
+    // Version 1 for signed composition time offsets.
+    moof[p + 8..p + 12].copy_from_slice(&(0x0100_0000 | trun_flags).to_be_bytes());
+    moof[p + 12..p + 16].copy_from_slice(&(samples.len() as u32).to_be_bytes());
+    moof[p + 16..p + 20].copy_from_slice(&data_offset.to_be_bytes());
+    p += TRUN_HEADER_SIZE;
+
+    // Per-sample: duration, size (left zero, patched after conversion), flags, cts.
+    for (i, s) in samples.iter().enumerate() {
+        let duration = sample_duration(samples, i);
+        moof[p..p + 4].copy_from_slice(&duration.to_be_bytes());
+        // size (p+4..p+8) is patched in the mdat conversion loop.
+        let flags: u32 = if s.is_sync { 0x0200_0000 } else { 0x0101_0000 };
+        moof[p + 8..p + 12].copy_from_slice(&flags.to_be_bytes());
+        let cts = (s.pts as i64 - s.dts as i64) as i32;
+        moof[p + 12..p + 16].copy_from_slice(&cts.to_be_bytes());
+        p += TRUN_PER_SAMPLE;
+    }
+
+    debug_assert_eq!(p, total);
 }
 
-fn build_mvhd_fmp4(timescale: u32) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Creation time
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Modification time
-    payload.extend_from_slice(&timescale.to_be_bytes()); // Timescale
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Duration (unknown for live)
-    payload.extend_from_slice(&0x0001_0000_u32.to_be_bytes()); // Rate (1.0)
-    payload.extend_from_slice(&0x0100_u16.to_be_bytes()); // Volume (1.0)
-    payload.extend_from_slice(&[0u8; 10]); // Reserved
-                                           // Unity matrix (36 bytes)
-    payload.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
-    payload.extend_from_slice(&[0u8; 12]);
-    payload.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
-    payload.extend_from_slice(&[0u8; 12]);
-    payload.extend_from_slice(&0x4000_0000_u32.to_be_bytes());
-    payload.extend_from_slice(&[0u8; 24]); // Pre-defined
-    payload.extend_from_slice(&2u32.to_be_bytes()); // Next track ID
-    build_box(b"mvhd", &payload)
+// ============================================================================
+// Init segment box building
+// ============================================================================
+
+fn write_box<F: FnOnce(&mut Vec<u8>)>(out: &mut Vec<u8>, typ: &[u8; 4], body: F) {
+    let start = out.len();
+    out.extend_from_slice(&[0, 0, 0, 0]); // size placeholder
+    out.extend_from_slice(typ);
+    body(out);
+    let size = (out.len() - start) as u32;
+    out[start..start + 4].copy_from_slice(&size.to_be_bytes());
 }
 
-fn build_mvex() -> Vec<u8> {
-    // trex (track extends) - default sample flags
-    let mut trex_payload = Vec::new();
-    trex_payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    trex_payload.extend_from_slice(&1u32.to_be_bytes()); // Track ID
-    trex_payload.extend_from_slice(&1u32.to_be_bytes()); // Default sample description index
-    trex_payload.extend_from_slice(&0u32.to_be_bytes()); // Default sample duration
-    trex_payload.extend_from_slice(&0u32.to_be_bytes()); // Default sample size
-    trex_payload.extend_from_slice(&0u32.to_be_bytes()); // Default sample flags
-    let trex = build_box(b"trex", &trex_payload);
-
-    build_box(b"mvex", &trex)
+fn write_ftyp(out: &mut Vec<u8>) {
+    write_box(out, b"ftyp", |o| {
+        o.extend_from_slice(b"iso5"); // major brand
+        o.extend_from_slice(&0u32.to_be_bytes()); // minor version
+        o.extend_from_slice(b"iso5");
+        o.extend_from_slice(b"iso6");
+        o.extend_from_slice(b"mp41");
+    });
 }
 
-fn build_trak_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-
-    // tkhd (track header)
-    let tkhd = build_tkhd_fmp4(config);
-    payload.extend_from_slice(&tkhd);
-
-    // mdia (media)
-    let mdia = build_mdia_fmp4(config);
-    payload.extend_from_slice(&mdia);
-
-    build_box(b"trak", &payload)
+fn write_moov(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"moov", |o| {
+        write_mvhd(o, config.timescale);
+        write_mvex(o);
+        write_trak(o, config);
+    });
 }
 
-fn build_tkhd_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0x0000_0003_u32.to_be_bytes()); // Version 0, flags: enabled + in_movie
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Creation time
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Modification time
-    payload.extend_from_slice(&1u32.to_be_bytes()); // Track ID
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Duration
-    payload.extend_from_slice(&[0u8; 8]); // Reserved
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Layer
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Alternate group
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Volume (0 for video)
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Reserved
-                                                    // Unity matrix (36 bytes)
-    payload.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
-    payload.extend_from_slice(&[0u8; 12]);
-    payload.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
-    payload.extend_from_slice(&[0u8; 12]);
-    payload.extend_from_slice(&0x4000_0000_u32.to_be_bytes());
-    // Width and height in fixed-point 16.16
-    payload.extend_from_slice(&((config.width) << 16).to_be_bytes());
-    payload.extend_from_slice(&((config.height) << 16).to_be_bytes());
-    build_box(b"tkhd", &payload)
+fn write_mvhd(out: &mut Vec<u8>, timescale: u32) {
+    write_box(out, b"mvhd", |o| {
+        o.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+        o.extend_from_slice(&0u32.to_be_bytes()); // creation time
+        o.extend_from_slice(&0u32.to_be_bytes()); // modification time
+        o.extend_from_slice(&timescale.to_be_bytes());
+        o.extend_from_slice(&0u32.to_be_bytes()); // duration (unknown for live)
+        o.extend_from_slice(&0x0001_0000_u32.to_be_bytes()); // rate (1.0)
+        o.extend_from_slice(&0x0100_u16.to_be_bytes()); // volume
+        o.extend_from_slice(&[0u8; 10]); // reserved
+                                         // Unity matrix.
+        o.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        o.extend_from_slice(&[0u8; 12]);
+        o.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        o.extend_from_slice(&[0u8; 12]);
+        o.extend_from_slice(&0x4000_0000_u32.to_be_bytes());
+        o.extend_from_slice(&[0u8; 24]); // pre-defined
+        o.extend_from_slice(&2u32.to_be_bytes()); // next track ID
+    });
 }
 
-fn build_mdia_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
+fn write_mvex(out: &mut Vec<u8>) {
+    write_box(out, b"mvex", |o| {
+        write_box(o, b"trex", |t| {
+            t.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+            t.extend_from_slice(&1u32.to_be_bytes()); // track ID
+            t.extend_from_slice(&1u32.to_be_bytes()); // default sample description index
+            t.extend_from_slice(&0u32.to_be_bytes()); // default sample duration
+            t.extend_from_slice(&0u32.to_be_bytes()); // default sample size
+            t.extend_from_slice(&0u32.to_be_bytes()); // default sample flags
+        });
+    });
+}
 
-    // mdhd (media header)
-    let mdhd = build_mdhd_fmp4(config.timescale, None);
-    payload.extend_from_slice(&mdhd);
+fn write_trak(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"trak", |o| {
+        write_tkhd(o, config);
+        write_mdia(o, config);
+    });
+}
 
-    // hdlr (handler)
-    let hdlr = build_hdlr_video();
-    payload.extend_from_slice(&hdlr);
+fn write_tkhd(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"tkhd", |o| {
+        o.extend_from_slice(&0x0000_0003_u32.to_be_bytes()); // enabled + in_movie
+        o.extend_from_slice(&0u32.to_be_bytes()); // creation time
+        o.extend_from_slice(&0u32.to_be_bytes()); // modification time
+        o.extend_from_slice(&1u32.to_be_bytes()); // track ID
+        o.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        o.extend_from_slice(&0u32.to_be_bytes()); // duration
+        o.extend_from_slice(&[0u8; 8]); // reserved
+        o.extend_from_slice(&0u16.to_be_bytes()); // layer
+        o.extend_from_slice(&0u16.to_be_bytes()); // alternate group
+        o.extend_from_slice(&0u16.to_be_bytes()); // volume (0 for video)
+        o.extend_from_slice(&0u16.to_be_bytes()); // reserved
+                                                  // Unity matrix.
+        o.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        o.extend_from_slice(&[0u8; 12]);
+        o.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        o.extend_from_slice(&[0u8; 12]);
+        o.extend_from_slice(&0x4000_0000_u32.to_be_bytes());
+        // Width/height in fixed-point 16.16.
+        o.extend_from_slice(&((config.width) << 16).to_be_bytes());
+        o.extend_from_slice(&((config.height) << 16).to_be_bytes());
+    });
+}
 
-    // minf (media info)
-    let minf = build_minf_fmp4(config);
-    payload.extend_from_slice(&minf);
+fn write_mdia(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"mdia", |o| {
+        write_mdhd(o, config.timescale);
+        write_hdlr_video(o);
+        write_minf(o, config);
+    });
+}
 
-    build_box(b"mdia", &payload)
+fn write_mdhd(out: &mut Vec<u8>, timescale: u32) {
+    write_box(out, b"mdhd", |o| {
+        o.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+        o.extend_from_slice(&0u32.to_be_bytes()); // creation time
+        o.extend_from_slice(&0u32.to_be_bytes()); // modification time
+        o.extend_from_slice(&timescale.to_be_bytes());
+        o.extend_from_slice(&0u32.to_be_bytes()); // duration (unknown)
+        o.extend_from_slice(&encode_language_code("und"));
+        o.extend_from_slice(&0u16.to_be_bytes()); // quality
+    });
 }
 
 fn encode_language_code(language: &str) -> [u8; 2] {
-    // ISO 639-2/T language codes are packed into 16 bits as (c1<<10) | (c2<<5) | c3
-    // where each character is offset by 0x60
     let chars: Vec<char> = language.chars().take(3).collect();
     let c1 = chars.first().copied().unwrap_or('u') as u16;
     let c2 = chars.get(1).copied().unwrap_or('n') as u16;
     let c3 = chars.get(2).copied().unwrap_or('d') as u16;
-
     let packed = ((c1.saturating_sub(0x60) & 0x1F) << 10)
         | ((c2.saturating_sub(0x60) & 0x1F) << 5)
         | (c3.saturating_sub(0x60) & 0x1F);
-
     packed.to_be_bytes()
 }
 
-fn build_mdhd_fmp4(timescale: u32, language: Option<&str>) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Creation time
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Modification time
-    payload.extend_from_slice(&timescale.to_be_bytes()); // Timescale
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Duration (unknown)
-    payload.extend_from_slice(&encode_language_code(language.unwrap_or("und"))); // Language
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Quality
-    build_box(b"mdhd", &payload)
+fn write_hdlr_video(out: &mut Vec<u8>) {
+    write_box(out, b"hdlr", |o| {
+        o.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+        o.extend_from_slice(&0u32.to_be_bytes()); // pre-defined
+        o.extend_from_slice(b"vide");
+        o.extend_from_slice(&[0u8; 12]); // reserved
+        o.extend_from_slice(b"VideoHandler\0");
+    });
 }
 
-fn build_hdlr_video() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Pre-defined
-    payload.extend_from_slice(b"vide"); // Handler type
-    payload.extend_from_slice(&[0u8; 12]); // Reserved
-    payload.extend_from_slice(b"VideoHandler\0"); // Name
-    build_box(b"hdlr", &payload)
+fn write_minf(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"minf", |o| {
+        write_vmhd(o);
+        write_dinf(o);
+        write_stbl(o, config);
+    });
 }
 
-fn build_minf_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-
-    // vmhd (video media header)
-    let vmhd = build_vmhd();
-    payload.extend_from_slice(&vmhd);
-
-    // dinf (data information)
-    let dinf = build_dinf();
-    payload.extend_from_slice(&dinf);
-
-    // stbl (sample table) - minimal for fMP4
-    let stbl = build_stbl_fmp4(config);
-    payload.extend_from_slice(&stbl);
-
-    build_box(b"minf", &payload)
+fn write_vmhd(out: &mut Vec<u8>) {
+    write_box(out, b"vmhd", |o| {
+        o.extend_from_slice(&0x0000_0001_u32.to_be_bytes());
+        o.extend_from_slice(&[0u8; 8]); // graphics mode + op color
+    });
 }
 
-fn build_vmhd() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0x0000_0001_u32.to_be_bytes()); // Version 0, flags: 1
-    payload.extend_from_slice(&[0u8; 8]); // Graphics mode + op color
-    build_box(b"vmhd", &payload)
+fn write_dinf(out: &mut Vec<u8>) {
+    write_box(out, b"dinf", |o| {
+        write_box(o, b"dref", |d| {
+            d.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+            d.extend_from_slice(&1u32.to_be_bytes()); // entry count
+            write_box(d, b"url ", |u| {
+                u.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // self-contained
+            });
+        });
+    });
 }
 
-fn build_dinf() -> Vec<u8> {
-    // dref with self-contained data reference
-    let mut dref_payload = Vec::new();
-    dref_payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    dref_payload.extend_from_slice(&1u32.to_be_bytes()); // Entry count
-                                                         // url box (self-contained)
-    let url_payload = [0x00, 0x00, 0x00, 0x01]; // Flags: self-contained
-    let url_box = build_box(b"url ", &url_payload);
-    dref_payload.extend_from_slice(&url_box);
-    let dref = build_box(b"dref", &dref_payload);
-
-    build_box(b"dinf", &dref)
+fn write_stbl(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"stbl", |o| {
+        write_stsd(o, config);
+        // Empty sample tables: actual data lives in moof/trun.
+        write_box(o, b"stts", |s| {
+            s.extend_from_slice(&0u32.to_be_bytes());
+            s.extend_from_slice(&0u32.to_be_bytes());
+        });
+        write_box(o, b"stsc", |s| {
+            s.extend_from_slice(&0u32.to_be_bytes());
+            s.extend_from_slice(&0u32.to_be_bytes());
+        });
+        write_box(o, b"stsz", |s| {
+            s.extend_from_slice(&0u32.to_be_bytes());
+            s.extend_from_slice(&0u32.to_be_bytes());
+            s.extend_from_slice(&0u32.to_be_bytes());
+        });
+        write_box(o, b"stco", |s| {
+            s.extend_from_slice(&0u32.to_be_bytes());
+            s.extend_from_slice(&0u32.to_be_bytes());
+        });
+    });
 }
 
-fn build_stbl_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-
-    // stsd (sample description)
-    let stsd = build_stsd_fmp4(config);
-    payload.extend_from_slice(&stsd);
-
-    // Empty stts (time-to-sample) - actual data in moof
-    let stts = build_empty_stts();
-    payload.extend_from_slice(&stts);
-
-    // Empty stsc (sample-to-chunk)
-    let stsc = build_empty_stsc();
-    payload.extend_from_slice(&stsc);
-
-    // Empty stsz (sample size)
-    let stsz = build_empty_stsz();
-    payload.extend_from_slice(&stsz);
-
-    // Empty stco (chunk offset)
-    let stco = build_empty_stco();
-    payload.extend_from_slice(&stco);
-
-    build_box(b"stbl", &payload)
+fn write_stsd(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"stsd", |o| {
+        o.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+        o.extend_from_slice(&1u32.to_be_bytes()); // entry count
+        match config.codec {
+            VideoCodec::H264 => write_avc1(o, config),
+            VideoCodec::H265 => write_hvc1(o, config),
+            VideoCodec::Av1 => write_av01(o, config),
+            VideoCodec::Vp9 => write_vp09(o, config),
+        }
+    });
 }
 
-fn build_stsd_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let sample_entry = if config.av1_sequence_header.is_some() {
-        build_av01_fmp4(config)
-    } else if config.vp9_config.is_some() {
-        build_vp09_fmp4(config)
-    } else if config.vps.is_some() {
-        build_hvc1_fmp4(config)
-    } else {
-        build_avc1_fmp4(config)
+fn write_visual_sample_entry_header(out: &mut Vec<u8>, width: u32, height: u32) {
+    out.extend_from_slice(&[0u8; 6]); // reserved
+    out.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+    out.extend_from_slice(&0u16.to_be_bytes()); // pre-defined
+    out.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    out.extend_from_slice(&[0u8; 12]); // pre-defined
+    out.extend_from_slice(&(width as u16).to_be_bytes());
+    out.extend_from_slice(&(height as u16).to_be_bytes());
+    out.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // 72 dpi
+    out.extend_from_slice(&0x0048_0000_u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    out.extend_from_slice(&1u16.to_be_bytes()); // frame count
+    out.extend_from_slice(&[0u8; 32]); // compressor name
+    out.extend_from_slice(&0x0018_u16.to_be_bytes()); // 24-bit depth
+    out.extend_from_slice(&0xffff_u16.to_be_bytes()); // pre-defined (-1)
+}
+
+fn write_avc1(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"avc1", |o| {
+        write_visual_sample_entry_header(o, config.width, config.height);
+        write_avcc(o, config);
+        write_colr(o, config);
+    });
+}
+
+/// Append a `colr` (nclx) box when the config carries color info. Placed
+/// after the codec configuration box, matching ffmpeg/MP4Box ordering.
+fn write_colr(out: &mut Vec<u8>, config: &FragmentConfig) {
+    let Some(color) = &config.color else {
+        return;
     };
-
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&1u32.to_be_bytes()); // Entry count
-    payload.extend_from_slice(&sample_entry);
-    build_box(b"stsd", &payload)
+    write_box(out, b"colr", |o| {
+        o.extend_from_slice(b"nclx");
+        o.extend_from_slice(&color.primaries.to_be_bytes());
+        o.extend_from_slice(&color.transfer.to_be_bytes());
+        o.extend_from_slice(&color.matrix.to_be_bytes());
+        o.push(if color.full_range { 0x80 } else { 0x00 });
+    });
 }
 
-fn build_avc1_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&[0u8; 6]); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Data reference index
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Pre-defined
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&[0u8; 12]); // Pre-defined
-    payload.extend_from_slice(&(config.width as u16).to_be_bytes());
-    payload.extend_from_slice(&(config.height as u16).to_be_bytes());
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Horizontal resolution (72 dpi)
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Vertical resolution (72 dpi)
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Frame count
-    payload.extend_from_slice(&[0u8; 32]); // Compressor name
-    payload.extend_from_slice(&0x0018_u16.to_be_bytes()); // Depth: 24-bit color
-    payload.extend_from_slice(&0xffff_u16.to_be_bytes()); // Pre-defined (-1)
-
-    // avcC (AVC Configuration)
-    let avcc = build_avcc_fmp4(config);
-    payload.extend_from_slice(&avcc);
-
-    build_box(b"avc1", &payload)
+fn write_avcc(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"avcC", |o| {
+        o.push(1); // configuration version
+        o.push(config.sps.get(1).copied().unwrap_or(0x42)); // profile
+        o.push(config.sps.get(2).copied().unwrap_or(0x00)); // profile compatibility
+        o.push(config.sps.get(3).copied().unwrap_or(0x1e)); // level
+        o.push(0xff); // 6 reserved + lengthSizeMinusOne (4-byte length prefix)
+        o.push(0xe1); // 3 reserved + numSPS
+        o.extend_from_slice(&(config.sps.len() as u16).to_be_bytes());
+        o.extend_from_slice(&config.sps);
+        o.push(1); // numPPS
+        o.extend_from_slice(&(config.pps.len() as u16).to_be_bytes());
+        o.extend_from_slice(&config.pps);
+    });
 }
 
-fn build_hvc1_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&[0u8; 6]); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Data reference index
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Pre-defined
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&[0u8; 12]); // Pre-defined
-    payload.extend_from_slice(&(config.width as u16).to_be_bytes());
-    payload.extend_from_slice(&(config.height as u16).to_be_bytes());
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Horizontal resolution (72 dpi)
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Vertical resolution (72 dpi)
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Frame count
-    payload.extend_from_slice(&[0u8; 32]); // Compressor name
-    payload.extend_from_slice(&0x0018_u16.to_be_bytes()); // Depth: 24-bit color
-    payload.extend_from_slice(&0xffff_u16.to_be_bytes()); // Pre-defined (-1)
-
-    // hvcC (HEVC Configuration)
-    let hvcc = build_hvcc_fmp4(config);
-    payload.extend_from_slice(&hvcc);
-
-    build_box(b"hvc1", &payload)
+fn write_hvc1(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"hvc1", |o| {
+        write_visual_sample_entry_header(o, config.width, config.height);
+        write_hvcc(o, config);
+        write_colr(o, config);
+    });
 }
 
-fn build_avcc_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = vec![
-        1,                                          // Configuration version
-        config.sps.get(1).copied().unwrap_or(0x42), // Profile
-        config.sps.get(2).copied().unwrap_or(0x00), // Profile compatibility
-        config.sps.get(3).copied().unwrap_or(0x1e), // Level
-        0xff, // 6 bits reserved + 2 bits NAL unit length - 1 (3 = 4 bytes)
-        0xe1, // 3 bits reserved + 5 bits number of SPS
-    ];
-    payload.extend_from_slice(&(config.sps.len() as u16).to_be_bytes());
-    payload.extend_from_slice(&config.sps);
-    payload.push(1); // Number of PPS
-    payload.extend_from_slice(&(config.pps.len() as u16).to_be_bytes());
-    payload.extend_from_slice(&config.pps);
-    build_box(b"avcC", &payload)
+fn write_hvcc(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"hvcC", |o| {
+        let num_arrays: u8 = if config.vps.is_some() { 3 } else { 2 };
+
+        // Profile/tier/level extracted from SPS without owning the bytes.
+        let byte1 = (sps_general_profile_space(&config.sps) << 6)
+            | (if sps_general_tier_flag(&config.sps) {
+                0x20
+            } else {
+                0
+            })
+            | (sps_general_profile_idc(&config.sps) & 0x1f);
+        let general_level_idc = sps_general_level_idc(&config.sps);
+
+        o.push(1); // configuration version
+        o.push(byte1);
+        o.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // profile compatibility
+        o.extend_from_slice(&[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]); // constraint indicator
+        o.push(general_level_idc);
+        o.extend_from_slice(&[0xf0, 0x00]); // min_spatial_segmentation_idc
+        o.push(0xfc); // parallelismType
+        o.push(0xfd); // chromaFormat (4:2:0)
+        o.push(0xf8); // bitDepthLumaMinus8 (8-bit)
+        o.push(0xf8); // bitDepthChromaMinus8 (8-bit)
+        o.extend_from_slice(&[0, 0]); // avgFrameRate
+        o.push(0x03); // constantFrameRate=0, numTemporalLayers=0, lengthSizeMinusOne=3
+        o.push(num_arrays);
+
+        if let Some(vps) = &config.vps {
+            o.push(0b1010_0000); // VPS array
+            o.extend_from_slice(&1u16.to_be_bytes());
+            o.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+            o.extend_from_slice(vps);
+        }
+
+        o.push(0b1010_0001); // SPS array
+        o.extend_from_slice(&1u16.to_be_bytes());
+        o.extend_from_slice(&(config.sps.len() as u16).to_be_bytes());
+        o.extend_from_slice(&config.sps);
+
+        o.push(0b1010_0010); // PPS array
+        o.extend_from_slice(&1u16.to_be_bytes());
+        o.extend_from_slice(&(config.pps.len() as u16).to_be_bytes());
+        o.extend_from_slice(&config.pps);
+    });
 }
 
-fn build_empty_stts() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Entry count
-    build_box(b"stts", &payload)
+fn write_av01(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"av01", |o| {
+        write_visual_sample_entry_header(o, config.width, config.height);
+        write_av1c(o, config);
+        write_colr(o, config);
+    });
 }
 
-fn build_empty_stsc() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Entry count
-    build_box(b"stsc", &payload)
+fn write_av1c(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"av1C", |o| {
+        let seq_header = config.av1_sequence_header.as_deref().unwrap_or(&[]);
+        let av1_config = extract_av1_config(seq_header);
+        let (seq_profile, seq_level_idx) = av1_config
+            .as_ref()
+            .map(|c| (c.seq_profile, c.seq_level_idx))
+            .unwrap_or((0, 0));
+
+        let byte1 = ((seq_profile & 0x07) << 5) | (seq_level_idx & 0x1f);
+        let byte2 = av1_config
+            .as_ref()
+            .map(|c| {
+                ((c.seq_tier & 0x01) << 7)
+                    | (if c.high_bitdepth { 0x40 } else { 0 })
+                    | (if c.twelve_bit { 0x20 } else { 0 })
+                    | (if c.monochrome { 0x10 } else { 0 })
+                    | (if c.chroma_subsampling_x { 0x08 } else { 0 })
+                    | (if c.chroma_subsampling_y { 0x04 } else { 0 })
+                    | (c.chroma_sample_position & 0x03)
+            })
+            .unwrap_or(0);
+        let obu_bytes = av1_config
+            .as_ref()
+            .map(|c| c.sequence_header.as_slice())
+            .unwrap_or(seq_header);
+
+        o.push(0x81); // marker (1) + version (1)
+        o.push(byte1);
+        o.push(byte2);
+        o.push(0x00); // no initial presentation delay
+        o.extend_from_slice(obu_bytes);
+    });
 }
 
-fn build_empty_stsz() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Sample size (0 = variable)
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Sample count
-    build_box(b"stsz", &payload)
+fn write_vp09(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"vp09", |o| {
+        write_visual_sample_entry_header(o, config.width, config.height);
+        write_vpcc(o, config);
+    });
 }
 
-fn build_empty_stco() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Entry count
-    build_box(b"stco", &payload)
-}
-
-fn build_hvcc_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let num_arrays: u8 = if config.vps.is_some() { 3 } else { 2 };
-
-    // Extract profile/tier/level from SPS (matches build_hvcc_box in mp4.rs)
-    let hevc_config = HevcConfig::new(
-        config.vps.clone().unwrap_or_default(),
-        config.sps.clone(),
-        config.pps.clone(),
-    );
-    let general_profile_space = hevc_config.general_profile_space();
-    let general_tier_flag = hevc_config.general_tier_flag();
-    let general_profile_idc = hevc_config.general_profile_idc();
-    let general_level_idc = hevc_config.general_level_idc();
-
-    let byte1 = (general_profile_space << 6)
-        | (if general_tier_flag { 0x20 } else { 0 })
-        | (general_profile_idc & 0x1f);
-
-    let mut payload = vec![
-        1,     // configuration_version
-        byte1, // general_profile_space (2) | general_tier_flag (1) | general_profile_idc (5)
-        0x60,
-        0x00,
-        0x00,
-        0x00, // general_profile_compatibility_flags
-        0x90,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,              // general_constraint_indicator_flags
-        general_level_idc, // general_level_idc
-        0xf0,
-        0x00, // min_spatial_segmentation_idc with reserved bits
-        0xfc, // parallelismType with reserved bits
-        0xfd, // chromaFormat with reserved bits (4:2:0)
-        0xf8, // bitDepthLumaMinus8 with reserved bits (8-bit)
-        0xf8, // bitDepthChromaMinus8 with reserved bits (8-bit)
-        0,
-        0,          // avgFrameRate
-        0x03, // constantFrameRate=0, numTemporalLayers=0, temporalIdNested=0, lengthSizeMinusOne=3
-        num_arrays, // numOfArrays
-    ];
-
-    // VPS array
-    if let Some(vps) = &config.vps {
-        payload.push(0b10100000); // array_completeness=1, reserved=0, nal_unit_type=32 (VPS)
-        payload.extend_from_slice(&(1u16).to_be_bytes()); // numNalus
-        payload.extend_from_slice(&(vps.len() as u16).to_be_bytes()); // nalUnitLength
-        payload.extend_from_slice(vps);
-    }
-
-    // SPS array
-    payload.push(0b10100001); // array_completeness=1, reserved=0, nal_unit_type=33 (SPS)
-    payload.extend_from_slice(&(1u16).to_be_bytes()); // numNalus
-    payload.extend_from_slice(&(config.sps.len() as u16).to_be_bytes()); // nalUnitLength
-    payload.extend_from_slice(&config.sps);
-
-    // PPS array
-    payload.push(0b10100010); // array_completeness=1, reserved=0, nal_unit_type=34 (PPS)
-    payload.extend_from_slice(&(1u16).to_be_bytes()); // numNalus
-    payload.extend_from_slice(&(config.pps.len() as u16).to_be_bytes()); // nalUnitLength
-    payload.extend_from_slice(&config.pps);
-
-    build_box(b"hvcC", &payload)
-}
-
-fn build_av01_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&[0u8; 6]); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Data reference index
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Pre-defined
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&[0u8; 12]); // Pre-defined
-    payload.extend_from_slice(&(config.width as u16).to_be_bytes());
-    payload.extend_from_slice(&(config.height as u16).to_be_bytes());
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Horizontal resolution (72 dpi)
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Vertical resolution (72 dpi)
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Frame count
-    payload.extend_from_slice(&[0u8; 32]); // Compressor name
-    payload.extend_from_slice(&0x0018_u16.to_be_bytes()); // Depth: 24-bit color
-    payload.extend_from_slice(&0xffff_u16.to_be_bytes()); // Pre-defined (-1)
-
-    // av1C (AV1 Configuration)
-    let av1c = build_av1c_fmp4(config);
-    payload.extend_from_slice(&av1c);
-
-    build_box(b"av01", &payload)
-}
-
-fn build_av1c_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let seq_header = config.av1_sequence_header.as_deref().unwrap_or(&[]);
-
-    let av1_config = extract_av1_config(seq_header);
-    let (seq_profile, seq_level_idx) = av1_config
-        .as_ref()
-        .map(|c| (c.seq_profile, c.seq_level_idx))
-        .unwrap_or((0, 0));
-
-    let byte1 = ((seq_profile & 0x07) << 5) | (seq_level_idx & 0x1f);
-
-    let byte2 = av1_config
-        .as_ref()
-        .map(|c| {
-            ((c.seq_tier & 0x01) << 7)
-                | (if c.high_bitdepth { 0x40 } else { 0 })
-                | (if c.twelve_bit { 0x20 } else { 0 })
-                | (if c.monochrome { 0x10 } else { 0 })
-                | (if c.chroma_subsampling_x { 0x08 } else { 0 })
-                | (if c.chroma_subsampling_y { 0x04 } else { 0 })
-                | (c.chroma_sample_position & 0x03)
-        })
-        .unwrap_or(0);
-
-    let obu_bytes = av1_config
-        .as_ref()
-        .map(|c| c.sequence_header.as_slice())
-        .unwrap_or(seq_header);
-
-    let mut payload = Vec::new();
-    payload.push(0x81); // marker (1) + version (1)
-    payload.push(byte1); // seq_profile (3) | seq_level_idx_0 (5)
-    payload.push(byte2); // seq_tier_0 | high_bitdepth | twelve_bit | monochrome | chroma_sub_x | chroma_sub_y | chroma_sample_position
-    payload.push(0x00); // no initial presentation delay
-    payload.extend_from_slice(obu_bytes);
-    build_box(b"av1C", &payload)
-}
-
-fn build_vp09_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&[0u8; 6]); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Data reference index
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Pre-defined
-    payload.extend_from_slice(&0u16.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&[0u8; 12]); // Pre-defined
-    payload.extend_from_slice(&(config.width as u16).to_be_bytes());
-    payload.extend_from_slice(&(config.height as u16).to_be_bytes());
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Horizontal resolution (72 dpi)
-    payload.extend_from_slice(&0x0048_0000_u32.to_be_bytes()); // Vertical resolution (72 dpi)
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Reserved
-    payload.extend_from_slice(&1u16.to_be_bytes()); // Frame count
-    payload.extend_from_slice(&[0u8; 32]); // Compressor name
-    payload.extend_from_slice(&0x0018_u16.to_be_bytes()); // Depth: 24-bit color
-    payload.extend_from_slice(&0xffff_u16.to_be_bytes()); // Pre-defined (-1)
-
-    // vpcC (VP9 Configuration)
-    let vpcc = build_vpcc_fmp4(config);
-    payload.extend_from_slice(&vpcc);
-
-    build_box(b"vp09", &payload)
-}
-
-fn build_vpcc_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-    if let Some(vp9_config) = &config.vp9_config {
-        payload.push(1); // version
-        payload.push(vp9_config.profile); // profile
-        payload.push(vp9_config.level); // level
-        payload.push(vp9_config.bit_depth); // bit_depth
-        payload.push(vp9_config.color_space); // color_space
-        payload.push(vp9_config.transfer_function); // transfer_function
-        payload.push(vp9_config.matrix_coefficients); // matrix_coefficients
-        payload.push(vp9_config.full_range_flag); // full_range_flag
-    }
-    build_box(b"vpcC", &payload)
-}
-
-// ============================================================================
-// Media segment building (moof + mdat)
-// ============================================================================
-
-fn build_media_segment(
-    samples: &[FragmentSample],
-    sequence_number: u32,
-    base_media_decode_time: u64,
-    _timescale: u32, // Reserved for future use (duration calculations)
-) -> Vec<u8> {
-    // Calculate total mdat size
-    let mdat_payload_size: usize = samples.iter().map(|s| s.data.len()).sum();
-
-    // Build moof first to get its size
-    let moof = build_moof(samples, sequence_number, base_media_decode_time);
-    let moof_size = moof.len() as u32;
-
-    // Data offset is moof_size + mdat_header(8)
-    let data_offset = moof_size + 8;
-
-    // Rebuild moof with correct data offset
-    let moof = build_moof_with_offset(
-        samples,
-        sequence_number,
-        base_media_decode_time,
-        data_offset,
-    );
-
-    // Build mdat
-    let mut segment = Vec::with_capacity(moof.len() + 8 + mdat_payload_size);
-    segment.extend_from_slice(&moof);
-
-    // mdat header
-    let mdat_size = (8 + mdat_payload_size) as u32;
-    segment.extend_from_slice(&mdat_size.to_be_bytes());
-    segment.extend_from_slice(b"mdat");
-
-    // mdat payload (all sample data)
-    for sample in samples {
-        segment.extend_from_slice(&sample.data);
-    }
-
-    segment
-}
-
-fn build_moof(
-    samples: &[FragmentSample],
-    sequence_number: u32,
-    base_media_decode_time: u64,
-) -> Vec<u8> {
-    build_moof_with_offset(samples, sequence_number, base_media_decode_time, 0)
-}
-
-fn build_moof_with_offset(
-    samples: &[FragmentSample],
-    sequence_number: u32,
-    base_media_decode_time: u64,
-    data_offset: u32,
-) -> Vec<u8> {
-    let mut payload = Vec::new();
-
-    // mfhd (movie fragment header)
-    let mfhd = build_mfhd(sequence_number);
-    payload.extend_from_slice(&mfhd);
-
-    // traf (track fragment)
-    let traf = build_traf(samples, base_media_decode_time, data_offset);
-    payload.extend_from_slice(&traf);
-
-    build_box(b"moof", &payload)
-}
-
-fn build_mfhd(sequence_number: u32) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0u32.to_be_bytes()); // Version + flags
-    payload.extend_from_slice(&sequence_number.to_be_bytes());
-    build_box(b"mfhd", &payload)
-}
-
-fn build_traf(
-    samples: &[FragmentSample],
-    base_media_decode_time: u64,
-    data_offset: u32,
-) -> Vec<u8> {
-    let mut payload = Vec::new();
-
-    // tfhd (track fragment header)
-    let tfhd = build_tfhd();
-    payload.extend_from_slice(&tfhd);
-
-    // tfdt (track fragment decode time)
-    let tfdt = build_tfdt(base_media_decode_time);
-    payload.extend_from_slice(&tfdt);
-
-    // trun (track run)
-    let trun = build_trun(samples, data_offset);
-    payload.extend_from_slice(&trun);
-
-    build_box(b"traf", &payload)
-}
-
-fn build_tfhd() -> Vec<u8> {
-    // Flags: 0x020000 = default-base-is-moof
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0x0002_0000_u32.to_be_bytes()); // Version 0 + flags
-    payload.extend_from_slice(&1u32.to_be_bytes()); // Track ID
-    build_box(b"tfhd", &payload)
-}
-
-fn build_tfdt(base_media_decode_time: u64) -> Vec<u8> {
-    // Version 1 for 64-bit decode time
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&0x0100_0000_u32.to_be_bytes()); // Version 1 + flags
-    payload.extend_from_slice(&base_media_decode_time.to_be_bytes());
-    build_box(b"tfdt", &payload)
-}
-
-fn build_trun(samples: &[FragmentSample], data_offset: u32) -> Vec<u8> {
-    // Flags:
-    // 0x000001 = data-offset-present
-    // 0x000100 = sample-duration-present
-    // 0x000200 = sample-size-present
-    // 0x000400 = sample-flags-present
-    // 0x000800 = sample-composition-time-offset-present
-    let flags: u32 = 0x000001 | 0x000100 | 0x000200 | 0x000400 | 0x000800;
-
-    let mut payload = Vec::new();
-    // Version 1 for signed composition time offsets
-    payload.extend_from_slice(&(0x0100_0000 | flags).to_be_bytes());
-    payload.extend_from_slice(&(samples.len() as u32).to_be_bytes()); // Sample count
-    payload.extend_from_slice(&data_offset.to_be_bytes()); // Data offset
-
-    // Per-sample data
-    for (i, sample) in samples.iter().enumerate() {
-        // Sample duration (estimate from DTS delta)
-        let duration = if i + 1 < samples.len() {
-            (samples[i + 1].dts - sample.dts) as u32
-        } else if i > 0 {
-            // Use previous duration for last sample
-            (sample.dts - samples[i - 1].dts) as u32
-        } else {
-            3000 // Default: 1 frame at 30fps
-        };
-        payload.extend_from_slice(&duration.to_be_bytes());
-
-        // Sample size
-        payload.extend_from_slice(&(sample.data.len() as u32).to_be_bytes());
-
-        // Sample flags
-        // Bits 24-25: depends_on (2 = no other samples)
-        // Bit 16: is_non_sync_sample
-        let flags = if sample.is_sync {
-            0x0200_0000_u32 // depends_on = 2, is_non_sync = 0
-        } else {
-            0x0101_0000_u32 // depends_on = 1, is_non_sync = 1
-        };
-        payload.extend_from_slice(&flags.to_be_bytes());
-
-        // Composition time offset (signed, pts - dts)
-        let cts = (sample.pts as i64 - sample.dts as i64) as i32;
-        payload.extend_from_slice(&cts.to_be_bytes());
-    }
-
-    build_box(b"trun", &payload)
+fn write_vpcc(out: &mut Vec<u8>, config: &FragmentConfig) {
+    write_box(out, b"vpcC", |o| {
+        if let Some(vp9_config) = &config.vp9_config {
+            o.push(1);
+            o.push(vp9_config.profile);
+            o.push(vp9_config.level);
+            o.push(vp9_config.bit_depth);
+            o.push(vp9_config.color_space);
+            o.push(vp9_config.transfer_function);
+            o.push(vp9_config.matrix_coefficients);
+            o.push(vp9_config.full_range_flag);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -963,112 +741,180 @@ mod tests {
         u64::from_be_bytes(data[offset..offset + 8].try_into().unwrap())
     }
 
+    fn h264_config() -> FragmentConfig {
+        FragmentConfig::default()
+    }
+
     #[test]
     fn init_segment_contains_ftyp_moov() {
-        let config = FragmentConfig::default();
-        let mut muxer = FragmentedMuxer::new(config);
-        let init = muxer.init_segment();
+        let muxer = FragmentedMuxer::new(h264_config());
+        let mut init = Vec::new();
+        muxer.write_init(&mut init);
 
-        // Check ftyp
         assert_eq!(&init[4..8], b"ftyp");
-
-        // Find moov
         let ftyp_size = u32::from_be_bytes(init[0..4].try_into().unwrap()) as usize;
         assert_eq!(&init[ftyp_size + 4..ftyp_size + 8], b"moov");
     }
 
     #[test]
-    fn init_segment_is_cached_after_first_call() {
-        let config = FragmentConfig::default();
-        let mut muxer = FragmentedMuxer::new(config);
-        let init1 = muxer.init_segment();
-        let init2 = muxer.init_segment();
-        assert_eq!(init1, init2);
+    fn fragment_contains_moof_mdat() {
+        let muxer = FragmentedMuxer::new(h264_config());
+        let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb, 0xcc, 0xdd];
+        let samples = [
+            SampleSpec {
+                frame: &frame,
+                pts: 0,
+                dts: 0,
+                is_sync: true,
+            },
+            SampleSpec {
+                frame: &frame,
+                pts: 3000,
+                dts: 3000,
+                is_sync: false,
+            },
+        ];
+
+        let mut out = Vec::new();
+        muxer.write_fragment(&mut out, 1, 0, &samples).unwrap();
+
+        assert_eq!(&out[4..8], b"moof");
+        let moof_size = u32::from_be_bytes(out[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&out[moof_size + 4..moof_size + 8], b"mdat");
     }
 
     #[test]
-    fn media_segment_contains_moof_mdat() {
-        let config = FragmentConfig::default();
-        let mut muxer = FragmentedMuxer::new(config);
-
-        // Write some samples
-        let sample_data = vec![0x00, 0x00, 0x00, 0x05, 0x65, 0xaa, 0xbb, 0xcc, 0xdd];
-        muxer.write_video(0, 0, &sample_data, true).unwrap();
-        muxer.write_video(3000, 3000, &sample_data, false).unwrap();
-
-        let segment = muxer.flush_segment().unwrap();
-
-        // Check moof
-        assert_eq!(&segment[4..8], b"moof");
-
-        // Find mdat
-        let moof_size = u32::from_be_bytes(segment[0..4].try_into().unwrap()) as usize;
-        assert_eq!(&segment[moof_size + 4..moof_size + 8], b"mdat");
+    fn fragment_with_no_samples_is_noop() {
+        let muxer = FragmentedMuxer::new(h264_config());
+        let mut out = Vec::new();
+        muxer.write_fragment(&mut out, 1, 0, &[]).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
-    fn ready_to_flush_tracks_sample_count_and_duration() {
-        let config = FragmentConfig {
-            fragment_duration_ms: 1,
-            ..Default::default()
-        };
-        let mut muxer = FragmentedMuxer::new(config);
-
-        assert!(!muxer.ready_to_flush(), "empty should not be ready");
-
-        let sample_data = vec![0, 0, 0, 5, 0x65, 1, 2, 3, 4];
-        muxer.write_video(0, 0, &sample_data, true).unwrap();
-        assert!(!muxer.ready_to_flush(), "single sample should not be ready");
-
-        // 1ms at 90kHz timescale is 90 ticks.
-        muxer.write_video(90, 90, &sample_data, false).unwrap();
-        assert!(
-            muxer.ready_to_flush(),
-            "two samples reaching duration should be ready"
+    fn non_monotonic_dts_is_rejected() {
+        let muxer = FragmentedMuxer::new(h264_config());
+        let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
+        let samples = [
+            SampleSpec {
+                frame: &frame,
+                pts: 0,
+                dts: 100,
+                is_sync: true,
+            },
+            SampleSpec {
+                frame: &frame,
+                pts: 3000,
+                dts: 50,
+                is_sync: false,
+            },
+        ];
+        let mut out = Vec::new();
+        let err = muxer.write_fragment(&mut out, 1, 0, &samples).unwrap_err();
+        assert_eq!(
+            err,
+            FragmentedError::NonMonotonicDts {
+                prev_dts: 100,
+                curr_dts: 50
+            }
         );
     }
 
     #[test]
-    fn tfdt_base_decode_time_advances_between_segments() {
-        let config = FragmentConfig::default();
-        let mut muxer = FragmentedMuxer::new(config);
+    fn tfdt_carries_caller_supplied_decode_time() {
+        let muxer = FragmentedMuxer::new(h264_config());
+        let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
+        let samples = [SampleSpec {
+            frame: &frame,
+            pts: 0,
+            dts: 0,
+            is_sync: true,
+        }];
 
-        let sample_data = vec![0, 0, 0, 5, 0x65, 1, 2, 3, 4];
-        muxer.write_video(0, 0, &sample_data, true).unwrap();
-        muxer.write_video(3000, 3000, &sample_data, false).unwrap();
-        let _seg1 = muxer.flush_segment().unwrap();
+        let mut out = Vec::new();
+        muxer.write_fragment(&mut out, 5, 12345, &samples).unwrap();
 
-        // base_media_decode_time should now be last.dts + avg_duration = 3000 + 3000 = 6000.
-        muxer.write_video(6000, 6000, &sample_data, true).unwrap();
-        let seg2 = muxer.flush_segment().unwrap();
+        let tfdt_off = find_box_offset(&out, b"tfdt").expect("tfdt box");
+        // payload: version+flags (4), decode time (8) starting at tfdt_off + 8
+        let base = read_u64_be(&out, tfdt_off + 8 + 4);
+        assert_eq!(base, 12345);
+    }
 
-        let tfdt_off = find_box_offset(&seg2, b"tfdt").expect("tfdt box");
-        let tfdt_size = read_u32_be(&seg2, tfdt_off) as usize;
-        assert!(tfdt_size >= 8 + 12);
-        // payload: version+flags (4), baseMediaDecodeTime (8)
-        let base = read_u64_be(&seg2, tfdt_off + 8 + 4);
-        assert_eq!(base, 6000);
+    #[test]
+    fn mfhd_carries_caller_sequence_number() {
+        let muxer = FragmentedMuxer::new(h264_config());
+        let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
+        let samples = [SampleSpec {
+            frame: &frame,
+            pts: 0,
+            dts: 0,
+            is_sync: true,
+        }];
+
+        let mut out = Vec::new();
+        muxer.write_fragment(&mut out, 42, 0, &samples).unwrap();
+
+        let mfhd_off = find_box_offset(&out, b"mfhd").expect("mfhd box");
+        let seq = read_u32_be(&out, mfhd_off + 8 + 4);
+        assert_eq!(seq, 42);
     }
 
     #[test]
     fn trun_single_sample_uses_default_duration_3000() {
-        let config = FragmentConfig::default();
-        let mut muxer = FragmentedMuxer::new(config);
+        let muxer = FragmentedMuxer::new(h264_config());
+        let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
+        let samples = [SampleSpec {
+            frame: &frame,
+            pts: 0,
+            dts: 0,
+            is_sync: true,
+        }];
 
-        let sample_data = vec![0, 0, 0, 5, 0x65, 1, 2, 3, 4];
-        muxer.write_video(0, 0, &sample_data, true).unwrap();
-        let seg = muxer.flush_segment().unwrap();
+        let mut out = Vec::new();
+        muxer.write_fragment(&mut out, 1, 0, &samples).unwrap();
 
-        let trun_off = find_box_offset(&seg, b"trun").expect("trun box");
-        // payload begins after header (8): version+flags(4), sample_count(4), data_offset(4), then sample_duration(4)
-        let duration = read_u32_be(&seg, trun_off + 8 + 12);
+        let trun_off = find_box_offset(&out, b"trun").expect("trun box");
+        // payload: version+flags(4), sample_count(4), data_offset(4), then sample_duration(4)
+        let duration = read_u32_be(&out, trun_off + 8 + 12);
         assert_eq!(duration, 3000);
     }
 
     #[test]
-    fn flush_returns_none_when_empty() {
-        let config = FragmentConfig::default();
-        let mut muxer = FragmentedMuxer::new(config);
-        assert!(muxer.flush_segment().is_none());
+    fn fragment_buffer_can_be_reused_across_calls() {
+        let muxer = FragmentedMuxer::new(h264_config());
+        let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
+        let samples = [SampleSpec {
+            frame: &frame,
+            pts: 0,
+            dts: 0,
+            is_sync: true,
+        }];
+
+        let mut out = Vec::with_capacity(4096);
+        muxer.write_fragment(&mut out, 1, 0, &samples).unwrap();
+        let cap_after_first = out.capacity();
+        out.clear();
+        muxer.write_fragment(&mut out, 2, 3000, &samples).unwrap();
+        assert_eq!(out.capacity(), cap_after_first);
+    }
+
+    #[test]
+    fn moof_size_for_matches_actual_emit() {
+        let muxer = FragmentedMuxer::new(h264_config());
+        let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
+        let samples: Vec<SampleSpec> = (0..30)
+            .map(|i| SampleSpec {
+                frame: &frame,
+                pts: i * 3000,
+                dts: i * 3000,
+                is_sync: i == 0,
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        muxer.write_fragment(&mut out, 1, 0, &samples).unwrap();
+
+        let moof_size = u32::from_be_bytes(out[0..4].try_into().unwrap()) as usize;
+        assert_eq!(moof_size, moof_size_for(samples.len()));
     }
 }
