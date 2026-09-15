@@ -304,24 +304,35 @@ pub fn hevc_annexb_to_hvcc(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Append the HVCC-converted bytes onto `out`.
+/// Append the HVCC-converted bytes onto `out`. Parameter sets are left out:
+/// an `hvc1` sample entry carries them, its samples must not.
 pub fn hevc_annexb_to_hvcc_into(data: &[u8], out: &mut Vec<u8>) {
-    let start = out.len();
+    let mut found = false;
     for nal in AnnexBNalIter::new(data) {
         if nal.is_empty() {
             continue;
         }
-        let len = nal.len() as u32;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(nal);
+        found = true;
+        push_sample_nal(nal, out);
     }
 
     // Fallback: if no start codes found, treat entire input as single NAL
-    if out.len() == start && !data.is_empty() {
-        let len = data.len() as u32;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(data);
+    if !found && !data.is_empty() {
+        push_sample_nal(data, out);
     }
+}
+
+/// Length-prefix one NAL into a sample, unless it is a VPS, SPS or PPS.
+fn push_sample_nal(nal: &[u8], out: &mut Vec<u8>) {
+    if matches!(
+        hevc_nal_type(nal),
+        nal_type::VPS | nal_type::SPS | nal_type::PPS
+    ) {
+        return;
+    }
+    let len = nal.len() as u32;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(nal);
 }
 
 /// Check if the given Annex B data represents an HEVC keyframe (IRAP).
@@ -433,19 +444,35 @@ mod tests {
     #[test]
     fn test_hevc_annexb_to_hvcc() {
         let annexb = [
-            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, // VPS (3 bytes)
-            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, // SPS (2 bytes)
+            0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf, // IDR_W_RADL (3 bytes)
+            0x00, 0x00, 0x00, 0x01, 0x02, 0x01, // TRAIL_R (2 bytes)
         ];
 
         let hvcc = hevc_annexb_to_hvcc(&annexb);
 
         // First NAL: length 3 + data
         assert_eq!(&hvcc[0..4], &[0x00, 0x00, 0x00, 0x03]);
-        assert_eq!(&hvcc[4..7], &[0x40, 0x01, 0x0c]);
+        assert_eq!(&hvcc[4..7], &[0x26, 0x01, 0xaf]);
 
         // Second NAL: length 2 + data
         assert_eq!(&hvcc[7..11], &[0x00, 0x00, 0x00, 0x02]);
-        assert_eq!(&hvcc[11..13], &[0x42, 0x01]);
+        assert_eq!(&hvcc[11..13], &[0x02, 0x01]);
+    }
+
+    #[test]
+    fn parameter_sets_stay_out_of_the_sample() {
+        let annexb = [
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, // VPS
+            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, // SPS
+            0x00, 0x00, 0x00, 0x01, 0x44, 0x01, // PPS
+            0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf, // IDR_W_RADL
+        ];
+
+        assert_eq!(
+            hevc_annexb_to_hvcc(&annexb),
+            [0x00, 0x00, 0x00, 0x03, 0x26, 0x01, 0xaf]
+        );
+        assert!(hevc_annexb_to_hvcc(&[0x42, 0x01]).is_empty());
     }
 
     #[test]

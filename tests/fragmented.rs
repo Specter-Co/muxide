@@ -138,6 +138,30 @@ fn h265_init_and_fragment() {
     assert!(fragment.windows(4).any(|w| w == b"mdat"));
 }
 
+/// A recorded SPS whose emulation-prevention bytes sit before its level.
+const FIXTURE_SPS: [u8; 19] = [
+    0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+    0x00, 0x78, 0xa0,
+];
+
+/// Its hvcC fields, configurationVersion through general_level_idc.
+const FIXTURE_HVCC_FIELDS: [u8; 13] = [
+    0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78,
+];
+
+#[test]
+fn hvcc_carries_the_sps_profile_tier_level() {
+    let config = FragmentConfig {
+        sps: FIXTURE_SPS.to_vec(),
+        ..h265_config()
+    };
+    let data = vec![0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaf, 0x06];
+    let (init, _) = write_init_and_fragment(config, &data);
+
+    let at = init.windows(4).position(|w| w == b"hvcC").expect("hvcC");
+    assert_eq!(init[at + 4..at + 17], FIXTURE_HVCC_FIELDS);
+}
+
 #[test]
 fn av1_init_and_fragment() {
     let data = vec![0x12, 0x00, 0x32, 0x02, 0x00, 0x00];

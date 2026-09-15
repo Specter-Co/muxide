@@ -7,6 +7,14 @@ use support::SharedBuffer;
 
 /// Helper to build a minimal HEVC keyframe with VPS, SPS, PPS, and IDR slice.
 fn build_hevc_keyframe() -> Vec<u8> {
+    build_hevc_keyframe_with_sps(&[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16, 0x59, 0x59, 0xa4, 0x93, 0x24, 0xb8,
+    ])
+}
+
+/// The same keyframe around the given SPS NAL.
+fn build_hevc_keyframe_with_sps(sps: &[u8]) -> Vec<u8> {
     let mut data = Vec::new();
 
     // VPS NAL (type 32) - 0x40 = (32 << 1)
@@ -18,10 +26,7 @@ fn build_hevc_keyframe() -> Vec<u8> {
 
     // SPS NAL (type 33) - 0x42 = (33 << 1)
     data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // Start code
-    data.extend_from_slice(&[
-        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
-        0x03, 0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16, 0x59, 0x59, 0xa4, 0x93, 0x24, 0xb8,
-    ]);
+    data.extend_from_slice(sps);
 
     // PPS NAL (type 34) - 0x44 = (34 << 1)
     data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // Start code
@@ -89,6 +94,38 @@ fn hevc_muxer_produces_hvc1_sample_entry() {
         contains_box(&produced, b"hvcC"),
         "Output should contain hvcC configuration box"
     );
+}
+
+/// A recorded SPS whose emulation-prevention bytes sit before its level.
+const FIXTURE_SPS: [u8; 19] = [
+    0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+    0x00, 0x78, 0xa0,
+];
+
+/// Its hvcC fields, configurationVersion through general_level_idc.
+const FIXTURE_HVCC_FIELDS: [u8; 13] = [
+    0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78,
+];
+
+#[test]
+fn hvcc_carries_the_sps_profile_tier_level() {
+    let (writer, buffer) = SharedBuffer::new();
+
+    let mut muxer = MuxerBuilder::new(writer)
+        .video(VideoCodec::H265, 1920, 1080, 30.0)
+        .build()
+        .expect("build should succeed");
+    muxer
+        .write_video(0.0, &build_hevc_keyframe_with_sps(&FIXTURE_SPS), true)
+        .expect("write_video should succeed");
+    muxer.finish().expect("finish should succeed");
+
+    let produced = buffer.lock().unwrap();
+    let at = produced
+        .windows(4)
+        .position(|w| w == b"hvcC")
+        .expect("hvcC");
+    assert_eq!(produced[at + 4..at + 17], FIXTURE_HVCC_FIELDS);
 }
 
 #[test]

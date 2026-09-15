@@ -206,24 +206,32 @@ pub fn annexb_to_avcc(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Append the AVCC-converted bytes onto `out`.
+/// Append the AVCC-converted bytes onto `out`. Parameter sets are left out:
+/// an `avc1` sample entry carries them, its samples must not.
 pub fn annexb_to_avcc_into(data: &[u8], out: &mut Vec<u8>) {
-    let start = out.len();
+    let mut found = false;
     for nal in AnnexBNalIter::new(data) {
         if nal.is_empty() {
             continue;
         }
-        let len = nal.len() as u32;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(nal);
+        found = true;
+        push_sample_nal(nal, out);
     }
 
     // Fallback: if no start codes found, treat entire input as single NAL
-    if out.len() == start && !data.is_empty() {
-        let len = data.len() as u32;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(data);
+    if !found && !data.is_empty() {
+        push_sample_nal(data, out);
     }
+}
+
+/// Length-prefix one NAL into a sample, unless it is an SPS or PPS.
+fn push_sample_nal(nal: &[u8], out: &mut Vec<u8>) {
+    if matches!(nal[0] & 0x1f, nal_type::SPS | nal_type::PPS) {
+        return;
+    }
+    let len = nal.len() as u32;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(nal);
 }
 
 /// Check if the given Annex B data represents a keyframe (IDR slice).
@@ -298,19 +306,34 @@ mod tests {
     #[test]
     fn test_annexb_to_avcc() {
         let annexb = [
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, // SPS (3 bytes)
-            0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, // PPS (2 bytes)
+            0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, // IDR (3 bytes)
+            0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, // non-IDR (2 bytes)
         ];
 
         let avcc = annexb_to_avcc(&annexb);
 
         // First NAL: length 3 + data
         assert_eq!(&avcc[0..4], &[0x00, 0x00, 0x00, 0x03]);
-        assert_eq!(&avcc[4..7], &[0x67, 0x64, 0x00]);
+        assert_eq!(&avcc[4..7], &[0x65, 0x88, 0x84]);
 
         // Second NAL: length 2 + data
         assert_eq!(&avcc[7..11], &[0x00, 0x00, 0x00, 0x02]);
-        assert_eq!(&avcc[11..13], &[0x68, 0xeb]);
+        assert_eq!(&avcc[11..13], &[0x41, 0x9a]);
+    }
+
+    #[test]
+    fn parameter_sets_stay_out_of_the_sample() {
+        let annexb = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, // SPS
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, // PPS
+            0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, // IDR
+        ];
+
+        assert_eq!(
+            annexb_to_avcc(&annexb),
+            [0x00, 0x00, 0x00, 0x03, 0x65, 0x88, 0x84]
+        );
+        assert!(annexb_to_avcc(&[0x67, 0x64, 0x00]).is_empty());
     }
 
     #[test]

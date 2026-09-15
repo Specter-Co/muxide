@@ -101,8 +101,8 @@ fn video_samples_writes_mdat_and_tables() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(be_u32(&stsz_payload[4..8]), 0);
     assert_eq!(be_u32(&stsz_payload[8..12]), 3);
 
-    // Frame0 contains 3 NALs (SPS, PPS, IDR), each length-prefixed.
-    let expected_size0 = (4 + 10) + (4 + 4) + (4 + 5); // based on fixture bytes
+    // Frame0 carries SPS, PPS and IDR; only the IDR reaches the sample.
+    let expected_size0 = 4 + 5; // based on fixture bytes
     let expected_size1 = 4 + (frame1.len() - 4); // start code removed, 4-byte length added
     let expected_size2 = 4 + (frame2.len() - 4);
 
