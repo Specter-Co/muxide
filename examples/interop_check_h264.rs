@@ -82,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pps: avc.pps,
         vps: None,
         av1_sequence_header: None,
+        color: None,
         vp9_config: None,
     };
 

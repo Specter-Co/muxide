@@ -322,8 +322,9 @@ fn parse_sequence_header(obu_data: &[u8], header_size: usize) -> Option<Av1Confi
             }
         }
 
-        // decoder_model_info_present_flag: 1 bit
-        let decoder_model_info_present = reader.read_bit()?;
+        // decoder_model_info_present_flag: 1 bit, only inside timing_info;
+        // absent timing info infers it false without consuming a bit
+        let decoder_model_info_present = timing_info_present && reader.read_bit()?;
         let mut buffer_delay_length = 0;
         if decoder_model_info_present {
             buffer_delay_length = reader.read_bits(5)? as u8 + 1;
@@ -914,5 +915,99 @@ mod tests {
         assert!(!cfg.high_bitdepth);
         assert!(!cfg.twelve_bit);
         assert!(!cfg.monochrome);
+    }
+
+    /// Packs `(bit_count, value)` fields MSB-first, zero-padding the last byte.
+    fn packed(fields: &[(u32, u64)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut acc = 0u8;
+        let mut filled = 0;
+        for &(count, value) in fields {
+            for i in (0..count).rev() {
+                acc = (acc << 1) | ((value >> i) & 1) as u8;
+                filled += 1;
+                if filled == 8 {
+                    out.push(acc);
+                    acc = 0;
+                    filled = 0;
+                }
+            }
+        }
+        if filled > 0 {
+            out.push(acc << (8 - filled));
+        }
+        out
+    }
+
+    /// A temporal delimiter followed by `payload` as a sequence header OBU,
+    /// the shape a temporal unit opens with.
+    fn temporal_unit_opening(payload: &[u8]) -> Vec<u8> {
+        let mut obus = vec![0x12, 0x00, 0x0A, payload.len() as u8];
+        obus.extend_from_slice(payload);
+        obus
+    }
+
+    /// Sequence headers written without timing info, which the AV1 ISOBMFF
+    /// binding recommends since the container carries timing, must still
+    /// yield a configuration: the decoder model flag is inferred, not read.
+    #[test]
+    fn extracts_config_from_headers_without_timing_info() {
+        // As encoded by SVT-AV1 for a 64x64 and a 256x256 GOP: profile 0,
+        // level 2.0, timing_info_present_flag = 0.
+        let headers: [&[u8]; 2] = [
+            &[
+                0x00, 0x00, 0x00, 0x02, 0xaf, 0xff, 0x9b, 0x5f, 0x22, 0x04, 0x04, 0x03, 0x08,
+            ],
+            &[
+                0x00, 0x00, 0x00, 0x03, 0xbf, 0xff, 0xf8, 0x95, 0xf2, 0x00, 0x80,
+            ],
+        ];
+        for payload in headers {
+            let unit = temporal_unit_opening(payload);
+            let cfg = extract_av1_config(&unit).expect("a configuration");
+            assert_eq!(cfg.seq_profile, 0);
+            assert_eq!(cfg.seq_level_idx, 0);
+            assert_eq!(cfg.seq_tier, 0);
+            assert!(!cfg.high_bitdepth);
+            assert!(!cfg.monochrome);
+            assert_eq!(&cfg.sequence_header[..], &unit[2..]);
+        }
+    }
+
+    /// With timing info present the decoder model flag is a real bit and the
+    /// header still parses to its end.
+    #[test]
+    fn extracts_config_from_a_header_with_timing_info() {
+        let mut payload = packed(&[
+            (3, 0),   // seq_profile
+            (1, 0),   // still_picture
+            (1, 0),   // reduced_still_picture_header
+            (1, 1),   // timing_info_present_flag
+            (32, 1),  // num_units_in_display_tick
+            (32, 30), // time_scale
+            (1, 0),   // equal_picture_interval
+            (1, 0),   // decoder_model_info_present_flag
+            (1, 0),   // initial_display_delay_present_flag
+            (5, 0),   // operating_points_cnt_minus_1
+            (12, 0),  // operating_point_idc[0]
+            (5, 3),   // seq_level_idx[0]
+        ]);
+        payload.extend_from_slice(&[0; 24]);
+        let cfg = extract_av1_config(&temporal_unit_opening(&payload)).expect("a configuration");
+        assert_eq!(cfg.seq_level_idx, 3);
+    }
+
+    /// A reduced still-picture header takes the short path and parses.
+    #[test]
+    fn extracts_config_from_a_reduced_still_picture_header() {
+        let mut payload = packed(&[
+            (3, 0), // seq_profile
+            (1, 1), // still_picture
+            (1, 1), // reduced_still_picture_header
+            (5, 5), // seq_level_idx[0]
+        ]);
+        payload.extend_from_slice(&[0; 24]);
+        let cfg = extract_av1_config(&temporal_unit_opening(&payload)).expect("a configuration");
+        assert_eq!(cfg.seq_level_idx, 5);
     }
 }
