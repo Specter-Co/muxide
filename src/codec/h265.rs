@@ -103,30 +103,82 @@ impl HevcConfig {
     pub fn general_level_idc(&self) -> u8 {
         sps_general_level_idc(&self.sps)
     }
+
+    /// Every general profile, tier and level field the SPS declares.
+    pub fn profile_tier_level(&self) -> ProfileTierLevel {
+        sps_profile_tier_level(&self.sps)
+    }
 }
 
-/// Extract general_profile_space from the SPS (bits 0-1 of byte 3).
+/// The general profile, tier and level an SPS declares, read after its
+/// emulation-prevention bytes are removed. A short SPS keeps the fallbacks
+/// the field accessors always had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileTierLevel {
+    pub profile_space: u8,
+    pub tier_flag: bool,
+    pub profile_idc: u8,
+    pub compatibility_flags: [u8; 4],
+    pub constraint_flags: [u8; 6],
+    pub level_idc: u8,
+}
+
+/// The NAL header and RBSP bytes through general_level_idc.
+const PROFILE_TIER_LEVEL_END: usize = 15;
+
+/// Parse profile_tier_level from the SPS. The two header bytes are never
+/// escaped; in the payload a 0x03 that follows two zero bytes is emulation
+/// prevention and is dropped.
+pub fn sps_profile_tier_level(sps: &[u8]) -> ProfileTierLevel {
+    let mut rbsp = [0u8; PROFILE_TIER_LEVEL_END];
+    let mut filled = sps.len().min(2);
+    rbsp[..filled].copy_from_slice(&sps[..filled]);
+    let mut zeros = 0;
+    for &byte in &sps[filled..] {
+        if filled == PROFILE_TIER_LEVEL_END {
+            break;
+        }
+        if zeros >= 2 && byte == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        rbsp[filled] = byte;
+        filled += 1;
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+
+    ProfileTierLevel {
+        profile_space: if filled > 3 { (rbsp[3] >> 6) & 0x03 } else { 0 },
+        tier_flag: filled > 3 && (rbsp[3] >> 5) & 0x01 != 0,
+        profile_idc: if filled > 3 { rbsp[3] & 0x1f } else { 1 },
+        compatibility_flags: [rbsp[4], rbsp[5], rbsp[6], rbsp[7]],
+        constraint_flags: [rbsp[8], rbsp[9], rbsp[10], rbsp[11], rbsp[12], rbsp[13]],
+        level_idc: if filled > 14 { rbsp[14] } else { 93 },
+    }
+}
+
+/// Extract general_profile_space from the SPS (bits 0-1 of RBSP byte 3).
 #[inline]
 pub fn sps_general_profile_space(sps: &[u8]) -> u8 {
-    sps.get(3).map(|b| (b >> 6) & 0x03).unwrap_or(0)
+    sps_profile_tier_level(sps).profile_space
 }
 
-/// Extract general_tier_flag from the SPS (bit 2 of byte 3).
+/// Extract general_tier_flag from the SPS (bit 2 of RBSP byte 3).
 #[inline]
 pub fn sps_general_tier_flag(sps: &[u8]) -> bool {
-    sps.get(3).map(|b| (b >> 5) & 0x01 != 0).unwrap_or(false)
+    sps_profile_tier_level(sps).tier_flag
 }
 
-/// Extract general_profile_idc from the SPS (bits 3-7 of byte 3).
+/// Extract general_profile_idc from the SPS (bits 3-7 of RBSP byte 3).
 #[inline]
 pub fn sps_general_profile_idc(sps: &[u8]) -> u8 {
-    sps.get(3).map(|b| b & 0x1f).unwrap_or(1)
+    sps_profile_tier_level(sps).profile_idc
 }
 
-/// Extract general_level_idc from the SPS (byte 14).
+/// Extract general_level_idc from the SPS (RBSP byte 14).
 #[inline]
 pub fn sps_general_level_idc(sps: &[u8]) -> u8 {
-    sps.get(14).copied().unwrap_or(93)
+    sps_profile_tier_level(sps).level_idc
 }
 
 /// Extract the NAL unit type from an H.265 NAL header.
@@ -436,5 +488,41 @@ mod tests {
         // Let's just verify the accessor works with a valid result
         let level = config.general_level_idc();
         assert!(level <= 186); // Max valid HEVC level
+    }
+
+    /// A recorded Main-profile SPS: three emulation-prevention bytes sit
+    /// before its level, so the raw byte at 14 reads 0 while the level is 120.
+    #[test]
+    fn profile_tier_level_reads_the_de_escaped_sps() {
+        let sps = [
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x78, 0xa0,
+        ];
+        assert_eq!(sps[14], 0);
+
+        let ptl = sps_profile_tier_level(&sps);
+        assert_eq!(ptl.profile_space, 0);
+        assert!(!ptl.tier_flag);
+        assert_eq!(ptl.profile_idc, 1);
+        assert_eq!(ptl.compatibility_flags, [0x60, 0x00, 0x00, 0x00]);
+        assert_eq!(ptl.constraint_flags, [0x80, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(ptl.level_idc, 120);
+    }
+
+    /// Without two zero bytes ahead of it, a 0x03 is data and stays.
+    #[test]
+    fn profile_tier_level_keeps_an_unescaped_sps_as_is() {
+        let sps = [
+            0x42, 0x01, 0x01, 0x21, 0x60, 0x01, 0x02, 0x03, 0x90, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x5d,
+        ];
+
+        let ptl = sps_profile_tier_level(&sps);
+        assert_eq!(ptl.profile_space, 0);
+        assert!(ptl.tier_flag);
+        assert_eq!(ptl.profile_idc, 1);
+        assert_eq!(ptl.compatibility_flags, [0x60, 0x01, 0x02, 0x03]);
+        assert_eq!(ptl.constraint_flags, [0x90, 0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(ptl.level_idc, 0x5d);
     }
 }

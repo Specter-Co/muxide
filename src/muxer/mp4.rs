@@ -1919,29 +1919,25 @@ fn build_hvcc_box(hevc_config: &HevcConfig) -> Vec<u8> {
     let mut payload = Vec::new();
 
     // Extract profile/tier/level from SPS
-    let general_profile_space = hevc_config.general_profile_space();
-    let general_tier_flag = hevc_config.general_tier_flag();
-    let general_profile_idc = hevc_config.general_profile_idc();
-    let general_level_idc = hevc_config.general_level_idc();
+    let ptl = hevc_config.profile_tier_level();
 
     // configurationVersion = 1
     payload.push(1);
 
     // general_profile_space (2) + general_tier_flag (1) + general_profile_idc (5)
-    let byte1 = (general_profile_space << 6)
-        | (if general_tier_flag { 0x20 } else { 0 })
-        | (general_profile_idc & 0x1f);
+    let byte1 = (ptl.profile_space << 6)
+        | (if ptl.tier_flag { 0x20 } else { 0 })
+        | (ptl.profile_idc & 0x1f);
     payload.push(byte1);
 
     // general_profile_compatibility_flags (4 bytes)
-    // For simplicity, set Main profile compatibility (bit 1)
-    payload.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    payload.extend_from_slice(&ptl.compatibility_flags);
 
     // general_constraint_indicator_flags (6 bytes)
-    payload.extend_from_slice(&[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    payload.extend_from_slice(&ptl.constraint_flags);
 
     // general_level_idc
-    payload.push(general_level_idc);
+    payload.push(ptl.level_idc);
 
     // min_spatial_segmentation_idc (12 bits) with reserved (4 bits)
     payload.extend_from_slice(&[0xf0, 0x00]);

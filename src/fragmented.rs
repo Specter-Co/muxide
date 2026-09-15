@@ -37,10 +37,7 @@
 use crate::api::VideoCodec;
 use crate::codec::av1::extract_av1_config;
 use crate::codec::h264::annexb_to_avcc_into;
-use crate::codec::h265::{
-    hevc_annexb_to_hvcc_into, sps_general_level_idc, sps_general_profile_idc,
-    sps_general_profile_space, sps_general_tier_flag,
-};
+use crate::codec::h265::{hevc_annexb_to_hvcc_into, sps_profile_tier_level};
 
 /// Errors that can occur during fragmented MP4 muxing.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -616,20 +613,16 @@ fn write_hvcc(out: &mut Vec<u8>, config: &FragmentConfig) {
         let num_arrays: u8 = if config.vps.is_some() { 3 } else { 2 };
 
         // Profile/tier/level extracted from SPS without owning the bytes.
-        let byte1 = (sps_general_profile_space(&config.sps) << 6)
-            | (if sps_general_tier_flag(&config.sps) {
-                0x20
-            } else {
-                0
-            })
-            | (sps_general_profile_idc(&config.sps) & 0x1f);
-        let general_level_idc = sps_general_level_idc(&config.sps);
+        let ptl = sps_profile_tier_level(&config.sps);
+        let byte1 = (ptl.profile_space << 6)
+            | (if ptl.tier_flag { 0x20 } else { 0 })
+            | (ptl.profile_idc & 0x1f);
 
         o.push(1); // configuration version
         o.push(byte1);
-        o.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // profile compatibility
-        o.extend_from_slice(&[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]); // constraint indicator
-        o.push(general_level_idc);
+        o.extend_from_slice(&ptl.compatibility_flags); // profile compatibility
+        o.extend_from_slice(&ptl.constraint_flags); // constraint indicator
+        o.push(ptl.level_idc);
         o.extend_from_slice(&[0xf0, 0x00]); // min_spatial_segmentation_idc
         o.push(0xfc); // parallelismType
         o.push(0xfd); // chromaFormat (4:2:0)
