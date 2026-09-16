@@ -24,7 +24,7 @@
 //! - Configuration box is `av1C`
 //! - Keyframes are identified by `frame_type == KEY_FRAME` in header
 
-use crate::assert_invariant;
+use crate::{assert_invariant, fragmented::ColorInfo};
 
 /// AV1 OBU type constants.
 pub mod obu_type {
@@ -101,6 +101,47 @@ impl Default for Av1Config {
             chroma_subsampling_x: true,
             chroma_subsampling_y: true,
             chroma_sample_position: 0,
+        }
+    }
+}
+
+impl Av1Config {
+    /// The `av01` codec string of the AV1 ISOBMFF binding: profile, level
+    /// index, tier and bit depth, then the colour fields whenever a `colr`
+    /// box will carry them, since the two must agree. A tail of defaults is
+    /// omitted, as the binding asks.
+    pub fn codec_string(&self, color: Option<&ColorInfo>) -> String {
+        const DEFAULT_COLOR: &str = ".0.110.01.01.01.0";
+
+        let tier = if self.seq_tier == 0 { 'M' } else { 'H' };
+        let depth = match (self.high_bitdepth, self.twelve_bit) {
+            (false, _) => 8,
+            (true, false) => 10,
+            (true, true) => 12,
+        };
+        let base = format!(
+            "av01.{}.{:02}{tier}.{depth:02}",
+            self.seq_profile, self.seq_level_idx
+        );
+
+        let Some(color) = color else {
+            return base;
+        };
+        let tail = format!(
+            ".{}.{}{}{}.{:02}.{:02}.{:02}.{}",
+            u8::from(self.monochrome),
+            u8::from(self.chroma_subsampling_x),
+            u8::from(self.chroma_subsampling_y),
+            self.chroma_sample_position,
+            color.primaries,
+            color.transfer,
+            color.matrix,
+            u8::from(color.full_range),
+        );
+        if tail == DEFAULT_COLOR {
+            base
+        } else {
+            base + &tail
         }
     }
 }
@@ -793,6 +834,50 @@ mod tests {
         assert!(cfg.chroma_subsampling_x);
         assert!(cfg.chroma_subsampling_y);
         assert_eq!(cfg.chroma_sample_position, 0);
+    }
+
+    /// Profile, two-digit level, tier and two-digit depth, no colour.
+    #[test]
+    fn codec_string_names_profile_level_tier_and_depth() {
+        let main = Av1Config {
+            seq_level_idx: 8,
+            ..Default::default()
+        };
+        assert_eq!(main.codec_string(None), "av01.0.08M.08");
+
+        let high = Av1Config {
+            high_bitdepth: true,
+            seq_level_idx: 13,
+            seq_profile: 1,
+            seq_tier: 1,
+            ..Default::default()
+        };
+        assert_eq!(high.codec_string(None), "av01.1.13H.10");
+    }
+
+    /// A `colr` box's colour is written whole, unless it is all defaults.
+    #[test]
+    fn codec_string_carries_the_colr_colour() {
+        let cfg = Av1Config {
+            seq_level_idx: 8,
+            ..Default::default()
+        };
+        let full_range = ColorInfo {
+            primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            full_range: true,
+        };
+        assert_eq!(
+            cfg.codec_string(Some(&full_range)),
+            "av01.0.08M.08.0.110.01.01.01.1"
+        );
+
+        let limited = ColorInfo {
+            full_range: false,
+            ..full_range
+        };
+        assert_eq!(cfg.codec_string(Some(&limited)), "av01.0.08M.08");
     }
 
     #[test]

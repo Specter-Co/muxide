@@ -3,6 +3,7 @@
 mod support;
 
 use muxide::api::{MuxerBuilder, VideoCodec};
+use muxide::codec::h265::sps_profile_tier_level;
 use support::SharedBuffer;
 
 /// Helper to build a minimal HEVC keyframe with VPS, SPS, PPS, and IDR slice.
@@ -126,6 +127,15 @@ fn hvcc_carries_the_sps_profile_tier_level() {
         .position(|w| w == b"hvcC")
         .expect("hvcC");
     assert_eq!(produced[at + 4..at + 17], FIXTURE_HVCC_FIELDS);
+}
+
+/// The string a manifest advertises reads the same fields the hvcC carries.
+#[test]
+fn codec_string_agrees_with_the_hvcc_fields() {
+    assert_eq!(
+        sps_profile_tier_level(&FIXTURE_SPS).codec_string(),
+        "hvc1.1.6.L120.80"
+    );
 }
 
 #[test]

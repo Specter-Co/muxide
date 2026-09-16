@@ -70,6 +70,17 @@ impl AvcConfig {
     pub fn level_idc(&self) -> u8 {
         self.sps.get(3).copied().unwrap_or(31)
     }
+
+    /// The `avc1` codec string of RFC 6381: profile, constraint flags and
+    /// level, each as two hex digits.
+    pub fn codec_string(&self) -> String {
+        format!(
+            "avc1.{:02X}{:02X}{:02X}",
+            self.profile_idc(),
+            self.profile_compatibility(),
+            self.level_idc()
+        )
+    }
 }
 
 /// Default SPS for 640x480 @ Baseline Profile, Level 3.0.
@@ -301,6 +312,16 @@ mod tests {
         assert_eq!(config.profile_idc(), 0x64); // 100 = High
         assert_eq!(config.profile_compatibility(), 0x00);
         assert_eq!(config.level_idc(), 0x28); // 40 = Level 4.0
+    }
+
+    /// Every field keeps its two digits, so a low level pads.
+    #[test]
+    fn codec_string_writes_six_hex_digits() {
+        let high_40 = AvcConfig::new(vec![0x67, 0x64, 0x00, 0x28], vec![0x68, 0xeb]);
+        assert_eq!(high_40.codec_string(), "avc1.640028");
+
+        let baseline_10 = AvcConfig::new(vec![0x67, 0x42, 0x00, 0x0A], vec![0x68, 0xeb]);
+        assert_eq!(baseline_10.codec_string(), "avc1.42000A");
     }
 
     #[test]

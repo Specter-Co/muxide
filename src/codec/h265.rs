@@ -123,6 +123,30 @@ pub struct ProfileTierLevel {
     pub level_idc: u8,
 }
 
+impl ProfileTierLevel {
+    /// The `hvc1` codec string of ISO/IEC 14496-15 Annex E: the profile in
+    /// its space, the compatibility flags bit-reversed in hex, the tier with
+    /// the level, then each constraint byte in hex through the last set one.
+    pub fn codec_string(&self) -> String {
+        let space = ["", "A", "B", "C"][usize::from(self.profile_space & 0x03)];
+        let compatibility = u32::from_be_bytes(self.compatibility_flags).reverse_bits();
+        let tier = if self.tier_flag { 'H' } else { 'L' };
+        let set = self
+            .constraint_flags
+            .iter()
+            .rposition(|byte| *byte != 0)
+            .map_or(0, |last| last + 1);
+        let constraints: String = self.constraint_flags[..set]
+            .iter()
+            .map(|byte| format!(".{byte:X}"))
+            .collect();
+        format!(
+            "hvc1.{space}{}.{compatibility:X}.{tier}{}{constraints}",
+            self.profile_idc, self.level_idc
+        )
+    }
+}
+
 /// The NAL header and RBSP bytes through general_level_idc.
 const PROFILE_TIER_LEVEL_END: usize = 15;
 
@@ -551,5 +575,21 @@ mod tests {
         assert_eq!(ptl.compatibility_flags, [0x60, 0x01, 0x02, 0x03]);
         assert_eq!(ptl.constraint_flags, [0x90, 0x01, 0x02, 0x03, 0x04, 0x05]);
         assert_eq!(ptl.level_idc, 0x5d);
+    }
+
+    /// Constraint bytes are hex numbers, unpadded, kept through the last
+    /// set one; the profile space is a letter only above zero.
+    #[test]
+    fn codec_string_writes_every_field_the_string_grammar_has() {
+        let ptl = ProfileTierLevel {
+            compatibility_flags: [0x60, 0x00, 0x00, 0x00],
+            constraint_flags: [0x90, 0x00, 0x0A, 0x00, 0x00, 0x00],
+            level_idc: 93,
+            profile_idc: 2,
+            profile_space: 1,
+            tier_flag: true,
+        };
+
+        assert_eq!(ptl.codec_string(), "hvc1.A2.6.H93.90.0.A");
     }
 }
