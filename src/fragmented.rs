@@ -29,7 +29,7 @@
 //! // send `out` to client; reuse the buffer when ready.
 //!
 //! let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa, 0xbb];
-//! let samples = [SampleSpec { frame: &frame, pts: 0, dts: 0, is_sync: true }];
+//! let samples = [SampleSpec { frame: &frame, pts: 0, dts: 0, duration: 3000, is_sync: true }];
 //! out.clear();
 //! muxer.write_fragment(&mut out, 1, 0, &samples).unwrap();
 //! ```
@@ -114,26 +114,15 @@ pub struct SampleSpec<'a> {
     pub frame: &'a [u8],
     pub pts: u64,
     pub dts: u64,
+    pub duration: u32,
     pub is_sync: bool,
-}
-
-/// Per-sample duration in trun: gap to next sample, or for the last sample
-/// mirror the previous gap. Single-sample fragments fall back to 3000 ticks.
-fn sample_duration(samples: &[SampleSpec<'_>], i: usize) -> u32 {
-    if i + 1 < samples.len() {
-        samples[i + 1].dts.saturating_sub(samples[i].dts) as u32
-    } else if i > 0 {
-        samples[i].dts.saturating_sub(samples[i - 1].dts) as u32
-    } else {
-        3000
-    }
 }
 
 /// The `base_media_decode_time` the next fragment should carry to continue
 /// the timeline that `write_fragment(samples)` wrote.
 pub fn next_base_media_decode_time(samples: &[SampleSpec<'_>]) -> Option<u64> {
-    let last_idx = samples.len().checked_sub(1)?;
-    Some(samples[last_idx].dts + sample_duration(samples, last_idx) as u64)
+    let last = samples.last()?;
+    Some(last.dts + u64::from(last.duration))
 }
 
 /// Fragmented MP4 muxer. Per-fragment counters are caller-managed so the muxer
@@ -328,9 +317,8 @@ fn write_moof_skeleton(
     p += TRUN_HEADER_SIZE;
 
     // Per-sample: duration, size (left zero, patched after conversion), flags, cts.
-    for (i, s) in samples.iter().enumerate() {
-        let duration = sample_duration(samples, i);
-        moof[p..p + 4].copy_from_slice(&duration.to_be_bytes());
+    for s in samples {
+        moof[p..p + 4].copy_from_slice(&s.duration.to_be_bytes());
         // size (p+4..p+8) is patched in the mdat conversion loop.
         let flags: u32 = if s.is_sync { 0x0200_0000 } else { 0x0101_0000 };
         moof[p + 8..p + 12].copy_from_slice(&flags.to_be_bytes());
@@ -758,12 +746,14 @@ mod tests {
                 frame: &frame,
                 pts: 0,
                 dts: 0,
+                duration: 3000,
                 is_sync: true,
             },
             SampleSpec {
                 frame: &frame,
                 pts: 3000,
                 dts: 3000,
+                duration: 3000,
                 is_sync: false,
             },
         ];
@@ -793,12 +783,14 @@ mod tests {
                 frame: &frame,
                 pts: 0,
                 dts: 100,
+                duration: 3000,
                 is_sync: true,
             },
             SampleSpec {
                 frame: &frame,
                 pts: 3000,
                 dts: 50,
+                duration: 3000,
                 is_sync: false,
             },
         ];
@@ -821,6 +813,7 @@ mod tests {
             frame: &frame,
             pts: 0,
             dts: 0,
+            duration: 3000,
             is_sync: true,
         }];
 
@@ -841,6 +834,7 @@ mod tests {
             frame: &frame,
             pts: 0,
             dts: 0,
+            duration: 3000,
             is_sync: true,
         }];
 
@@ -853,13 +847,14 @@ mod tests {
     }
 
     #[test]
-    fn trun_single_sample_uses_default_duration_3000() {
+    fn trun_writes_the_given_sample_duration() {
         let muxer = FragmentedMuxer::new(h264_config());
         let frame = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
         let samples = [SampleSpec {
             frame: &frame,
             pts: 0,
             dts: 0,
+            duration: 90_000,
             is_sync: true,
         }];
 
@@ -869,7 +864,8 @@ mod tests {
         let trun_off = find_box_offset(&out, b"trun").expect("trun box");
         // payload: version+flags(4), sample_count(4), data_offset(4), then sample_duration(4)
         let duration = read_u32_be(&out, trun_off + 8 + 12);
-        assert_eq!(duration, 3000);
+        assert_eq!(duration, 90_000);
+        assert_eq!(next_base_media_decode_time(&samples), Some(90_000));
     }
 
     #[test]
@@ -880,6 +876,7 @@ mod tests {
             frame: &frame,
             pts: 0,
             dts: 0,
+            duration: 3000,
             is_sync: true,
         }];
 
@@ -900,6 +897,7 @@ mod tests {
                 frame: &frame,
                 pts: i * 3000,
                 dts: i * 3000,
+                duration: 3000,
                 is_sync: i == 0,
             })
             .collect();

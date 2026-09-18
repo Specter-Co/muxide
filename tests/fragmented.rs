@@ -70,12 +70,14 @@ fn write_init_and_fragment(config: FragmentConfig, sample: &[u8]) -> (Vec<u8>, V
             frame: sample,
             pts: 0,
             dts: 0,
+            duration: 3000,
             is_sync: true,
         },
         SampleSpec {
             frame: sample,
             pts: 3000,
             dts: 3000,
+            duration: 3000,
             is_sync: false,
         },
     ];
@@ -95,12 +97,14 @@ fn dts_must_be_monotonic() {
             frame: &data,
             pts: 0,
             dts: 3000,
+            duration: 3000,
             is_sync: true,
         },
         SampleSpec {
             frame: &data,
             pts: 3000,
             dts: 1000,
+            duration: 3000,
             is_sync: false,
         },
     ];

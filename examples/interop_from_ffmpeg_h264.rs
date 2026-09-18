@@ -142,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 frame: au,
                 pts: ticks,
                 dts: ticks,
+                duration: dt as u32,
                 is_sync: is_h264_keyframe(au),
             }
         })

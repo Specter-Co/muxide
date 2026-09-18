@@ -97,18 +97,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame: &frame0,
             pts: 0,
             dts: 0,
+            duration: dt as u32,
             is_sync: true,
         },
         SampleSpec {
             frame: &frame1,
             pts: dt,
             dts: dt,
+            duration: dt as u32,
             is_sync: false,
         },
         SampleSpec {
             frame: &frame2,
             pts: 2 * dt,
             dts: 2 * dt,
+            duration: dt as u32,
             is_sync: false,
         },
     ];
