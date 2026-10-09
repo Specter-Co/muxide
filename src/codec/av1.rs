@@ -306,152 +306,6 @@ pub fn extract_av1_config(data: &[u8]) -> Option<Av1Config> {
     None
 }
 
-/// Parse the Sequence Header OBU payload to extract configuration.
-fn parse_sequence_header(obu_data: &[u8], header_size: usize) -> Option<Av1Config> {
-    // INV-202: Header size must be valid
-    assert_invariant!(
-        header_size <= obu_data.len(),
-        "AV1 header size must not exceed OBU data length",
-        "codec::av1::parse_sequence_header"
-    );
-
-    let payload = &obu_data[header_size..];
-    if payload.is_empty() {
-        return None;
-    }
-
-    // INV-203: Sequence header payload must be non-empty
-    assert_invariant!(
-        !payload.is_empty(),
-        "AV1 sequence header payload must be non-empty",
-        "codec::av1::parse_sequence_header"
-    );
-
-    // Create a bit reader for the payload
-    let mut reader = BitReader::new(payload);
-    let start = read_sequence_start(&mut reader)?;
-    let reduced_still_picture_header = start.reduced_still_picture_header;
-    let seq_profile = start.seq_profile;
-
-    // For reduced_still_picture_header, frame_id is not present
-    if !reduced_still_picture_header {
-        let frame_id_numbers_present = reader.read_bit()?;
-        if frame_id_numbers_present {
-            let delta_frame_id_length = reader.read_bits(4)? as usize + 2;
-            let _frame_id_length = reader.read_bits(3)? as usize + delta_frame_id_length + 1;
-        }
-    }
-
-    // use_128x128_superblock: 1 bit
-    reader.read_bit()?;
-    // enable_filter_intra: 1 bit
-    reader.read_bit()?;
-    // enable_intra_edge_filter: 1 bit
-    reader.read_bit()?;
-
-    // More flags for non-reduced headers
-    if !reduced_still_picture_header {
-        // enable_interintra_compound: 1 bit
-        reader.read_bit()?;
-        // enable_masked_compound: 1 bit
-        reader.read_bit()?;
-        // enable_warped_motion: 1 bit
-        reader.read_bit()?;
-        // enable_dual_filter: 1 bit
-        reader.read_bit()?;
-        // enable_order_hint: 1 bit
-        let enable_order_hint = reader.read_bit()?;
-        if enable_order_hint {
-            // enable_jnt_comp: 1 bit
-            reader.read_bit()?;
-            // enable_ref_frame_mvs: 1 bit
-            reader.read_bit()?;
-        }
-        // seq_choose_screen_content_tools: 1 bit
-        let seq_choose_screen_content_tools = reader.read_bit()?;
-        let seq_force_screen_content_tools = if seq_choose_screen_content_tools {
-            2 // SELECT_SCREEN_CONTENT_TOOLS
-        } else {
-            reader.read_bit()? as u8
-        };
-        if seq_force_screen_content_tools > 0 {
-            // seq_choose_integer_mv: 1 bit
-            let seq_choose_integer_mv = reader.read_bit()?;
-            if !seq_choose_integer_mv {
-                // seq_force_integer_mv: 1 bit
-                reader.read_bit()?;
-            }
-        }
-        if enable_order_hint {
-            // order_hint_bits_minus_1: 3 bits
-            reader.skip_bits(3)?;
-        }
-    }
-
-    // enable_superres: 1 bit
-    reader.read_bit()?;
-    // enable_cdef: 1 bit
-    reader.read_bit()?;
-    // enable_restoration: 1 bit
-    reader.read_bit()?;
-
-    // color_config
-    let (
-        high_bitdepth,
-        twelve_bit,
-        monochrome,
-        chroma_subsampling_x,
-        chroma_subsampling_y,
-        chroma_sample_position,
-    ) = parse_color_config(&mut reader, seq_profile)?;
-
-    // film_grain_params_present: 1 bit
-    reader.read_bit()?;
-
-    Some(Av1Config {
-        sequence_header: obu_data.to_vec(),
-        seq_profile,
-        seq_level_idx: start.seq_level_idx,
-        seq_tier: start.seq_tier,
-        high_bitdepth,
-        twelve_bit,
-        monochrome,
-        chroma_subsampling_x,
-        chroma_subsampling_y,
-        chroma_sample_position,
-    })
-}
-
-/// Rewrites the maximum frame size of every Sequence Header OBU in `data` to
-/// `width`x`height`, in place.
-///
-/// An encoder resized below the size it was created at keeps declaring that
-/// size as the maximum, and players size the picture from it. Writes nothing
-/// and returns `None` when a header does not parse or its size fields cannot
-/// hold the new size.
-pub fn set_av1_max_frame_size(data: &mut [u8], width: u32, height: u32) -> Option<()> {
-    let width_minus_1 = u64::from(width.checked_sub(1)?);
-    let height_minus_1 = u64::from(height.checked_sub(1)?);
-    let mut fields = Vec::new();
-    let mut offset = 0;
-    for (info, obu_data) in ObuIter::new(data) {
-        if info.obu_type == obu_type::SEQUENCE_HEADER {
-            let payload = obu_data.get(info.header_size..)?;
-            let size = read_sequence_start(&mut BitReader::new(payload))?.max_frame_size;
-            if width_minus_1 >> size.width_bits != 0 || height_minus_1 >> size.height_bits != 0 {
-                return None;
-            }
-            fields.push(((offset + info.header_size) * 8 + size.at, size));
-        }
-        offset += info.total_size;
-    }
-    for (at, size) in fields {
-        write_bits(data, at, size.width_bits, width_minus_1);
-        write_bits(data, at + size.width_bits, size.height_bits, height_minus_1);
-    }
-    Some(())
-}
-
 /// Where a sequence header's maximum frame size sits: the payload bit offset
 /// of `max_frame_width_minus_1` and the widths of both size fields.
 struct MaxFrameSize {
@@ -479,7 +333,7 @@ fn read_sequence_start(reader: &mut BitReader) -> Option<SequenceStart> {
     assert_invariant!(
         seq_profile <= 3,
         "AV1 sequence profile must be valid (0-3)",
-        "codec::av1::parse_sequence_header"
+        "codec::av1::read_sequence_start"
     );
 
     // still_picture: 1 bit
@@ -576,6 +430,156 @@ fn read_sequence_start(reader: &mut BitReader) -> Option<SequenceStart> {
         seq_profile,
         seq_tier,
     })
+}
+
+/// Parse the Sequence Header OBU payload to extract configuration.
+fn parse_sequence_header(obu_data: &[u8], header_size: usize) -> Option<Av1Config> {
+    // INV-202: Header size must be valid
+    assert_invariant!(
+        header_size <= obu_data.len(),
+        "AV1 header size must not exceed OBU data length",
+        "codec::av1::parse_sequence_header"
+    );
+
+    let payload = &obu_data[header_size..];
+    if payload.is_empty() {
+        return None;
+    }
+
+    // INV-203: Sequence header payload must be non-empty
+    assert_invariant!(
+        !payload.is_empty(),
+        "AV1 sequence header payload must be non-empty",
+        "codec::av1::parse_sequence_header"
+    );
+
+    // Create a bit reader for the payload
+    let mut reader = BitReader::new(payload);
+    let start = read_sequence_start(&mut reader)?;
+    let reduced_still_picture_header = start.reduced_still_picture_header;
+    let seq_level_idx = start.seq_level_idx;
+    let seq_profile = start.seq_profile;
+    let seq_tier = start.seq_tier;
+
+    // For reduced_still_picture_header, frame_id is not present
+    if !reduced_still_picture_header {
+        let frame_id_numbers_present = reader.read_bit()?;
+        if frame_id_numbers_present {
+            let delta_frame_id_length = reader.read_bits(4)? as usize + 2;
+            let _frame_id_length = reader.read_bits(3)? as usize + delta_frame_id_length + 1;
+        }
+    }
+
+    // use_128x128_superblock: 1 bit
+    reader.read_bit()?;
+    // enable_filter_intra: 1 bit
+    reader.read_bit()?;
+    // enable_intra_edge_filter: 1 bit
+    reader.read_bit()?;
+
+    // More flags for non-reduced headers
+    if !reduced_still_picture_header {
+        // enable_interintra_compound: 1 bit
+        reader.read_bit()?;
+        // enable_masked_compound: 1 bit
+        reader.read_bit()?;
+        // enable_warped_motion: 1 bit
+        reader.read_bit()?;
+        // enable_dual_filter: 1 bit
+        reader.read_bit()?;
+        // enable_order_hint: 1 bit
+        let enable_order_hint = reader.read_bit()?;
+        if enable_order_hint {
+            // enable_jnt_comp: 1 bit
+            reader.read_bit()?;
+            // enable_ref_frame_mvs: 1 bit
+            reader.read_bit()?;
+        }
+        // seq_choose_screen_content_tools: 1 bit
+        let seq_choose_screen_content_tools = reader.read_bit()?;
+        let seq_force_screen_content_tools = if seq_choose_screen_content_tools {
+            2 // SELECT_SCREEN_CONTENT_TOOLS
+        } else {
+            reader.read_bit()? as u8
+        };
+        if seq_force_screen_content_tools > 0 {
+            // seq_choose_integer_mv: 1 bit
+            let seq_choose_integer_mv = reader.read_bit()?;
+            if !seq_choose_integer_mv {
+                // seq_force_integer_mv: 1 bit
+                reader.read_bit()?;
+            }
+        }
+        if enable_order_hint {
+            // order_hint_bits_minus_1: 3 bits
+            reader.skip_bits(3)?;
+        }
+    }
+
+    // enable_superres: 1 bit
+    reader.read_bit()?;
+    // enable_cdef: 1 bit
+    reader.read_bit()?;
+    // enable_restoration: 1 bit
+    reader.read_bit()?;
+
+    // color_config
+    let (
+        high_bitdepth,
+        twelve_bit,
+        monochrome,
+        chroma_subsampling_x,
+        chroma_subsampling_y,
+        chroma_sample_position,
+    ) = parse_color_config(&mut reader, seq_profile)?;
+
+    // film_grain_params_present: 1 bit
+    reader.read_bit()?;
+
+    Some(Av1Config {
+        sequence_header: obu_data.to_vec(),
+        seq_profile,
+        seq_level_idx,
+        seq_tier,
+        high_bitdepth,
+        twelve_bit,
+        monochrome,
+        chroma_subsampling_x,
+        chroma_subsampling_y,
+        chroma_sample_position,
+    })
+}
+
+/// Rewrites the maximum frame size of every Sequence Header OBU in `data` to
+/// `width`x`height`, in place.
+///
+/// An encoder resized below the size it was created at keeps declaring that
+/// size as the maximum, and players size the picture from it. Every frame the
+/// headers govern must be `width`x`height` and code its size explicitly or by
+/// reference: a frame that takes its size from the maximum would decode at
+/// the new size. Writes nothing and returns `None` when a header does not
+/// parse or its size fields cannot hold the new size.
+pub fn set_av1_max_frame_size(data: &mut [u8], width: u32, height: u32) -> Option<()> {
+    let width_minus_1 = u64::from(width.checked_sub(1)?);
+    let height_minus_1 = u64::from(height.checked_sub(1)?);
+    let mut fields = Vec::new();
+    let mut offset = 0;
+    for (info, obu_data) in ObuIter::new(data) {
+        if info.obu_type == obu_type::SEQUENCE_HEADER {
+            let payload = obu_data.get(info.header_size..)?;
+            let size = read_sequence_start(&mut BitReader::new(payload))?.max_frame_size;
+            if width_minus_1 >> size.width_bits != 0 || height_minus_1 >> size.height_bits != 0 {
+                return None;
+            }
+            fields.push(((offset + info.header_size) * 8 + size.at, size));
+        }
+        offset += info.total_size;
+    }
+    for (at, size) in fields {
+        write_bits(data, at, size.width_bits, width_minus_1);
+        write_bits(data, at + size.width_bits, size.height_bits, height_minus_1);
+    }
+    Some(())
 }
 
 /// Parse color_config from sequence header.
@@ -1194,11 +1198,11 @@ mod tests {
         ObuIter::new(data)
             .filter(|(info, _)| info.obu_type == obu_type::SEQUENCE_HEADER)
             .map(|(info, obu_data)| {
-                let mut reader = BitReader::new(&obu_data[info.header_size..]);
-                let size = read_sequence_start(&mut reader)
+                let payload = &obu_data[info.header_size..];
+                let size = read_sequence_start(&mut BitReader::new(payload))
                     .expect("a sequence header")
                     .max_frame_size;
-                let mut reader = BitReader::new(&obu_data[info.header_size..]);
+                let mut reader = BitReader::new(payload);
                 reader.skip_bits(size.at).expect("the size fields");
                 (
                     reader.read_bits(size.width_bits).expect("the width") + 1,
@@ -1219,6 +1223,51 @@ mod tests {
         set_av1_max_frame_size(&mut data, 640, 512).expect("the size fits");
         assert_eq!(max_frame_sizes(&data), [(640, 512), (640, 512)]);
         let after = extract_av1_config(&data).expect("a configuration");
+        assert_eq!(
+            Av1Config {
+                sequence_header: Vec::new(),
+                ..after
+            },
+            Av1Config {
+                sequence_header: Vec::new(),
+                ..before
+            }
+        );
+    }
+
+    /// The size fields are found after variable-length timing info and a
+    /// tier bit, in a header behind another OBU.
+    #[test]
+    fn sets_the_maximum_frame_size_after_timing_info() {
+        let mut payload = packed(&[
+            (3, 0),     // seq_profile
+            (1, 0),     // still_picture
+            (1, 0),     // reduced_still_picture_header
+            (1, 1),     // timing_info_present_flag
+            (32, 1),    // num_units_in_display_tick
+            (32, 30),   // time_scale
+            (1, 1),     // equal_picture_interval
+            (3, 0b011), // num_ticks_per_picture_minus_1 = 2, as uvlc
+            (1, 0),     // decoder_model_info_present_flag
+            (1, 0),     // initial_display_delay_present_flag
+            (5, 0),     // operating_points_cnt_minus_1
+            (12, 0),    // operating_point_idc[0]
+            (5, 8),     // seq_level_idx[0]
+            (1, 1),     // seq_tier[0]
+            (4, 10),    // frame_width_bits_minus_1
+            (4, 10),    // frame_height_bits_minus_1
+            (11, 1919), // max_frame_width_minus_1
+            (11, 1079), // max_frame_height_minus_1
+        ]);
+        payload.extend_from_slice(&[0; 24]);
+        let mut unit = temporal_unit_opening(&payload);
+        let before = extract_av1_config(&unit).expect("a configuration");
+        assert_eq!(max_frame_sizes(&unit), [(1920, 1080)]);
+
+        set_av1_max_frame_size(&mut unit, 640, 512).expect("the size fits");
+        assert_eq!(max_frame_sizes(&unit), [(640, 512)]);
+        let after = extract_av1_config(&unit).expect("a configuration");
+        assert_eq!((after.seq_level_idx, after.seq_tier), (8, 1));
         assert_eq!(
             Av1Config {
                 sequence_header: Vec::new(),
